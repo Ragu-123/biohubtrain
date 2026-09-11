@@ -48,7 +48,8 @@ biohubtrain/
 │   └── micro_bench_kernels.py      # Architecture micro-benchmark
 ├── docs/                           # Literature survey & EDA reports
 ├── train.py                        # Top-level training runner
-└── evaluate.py                     # Top-level evaluation runner
+├── evaluate.py                     # Top-level evaluation runner
+└── submission_sota.py              # Production offline Kaggle test submission generator
 ```
 
 ## 4. Usage
@@ -63,8 +64,13 @@ python train.py --data-dir /kaggle/input/competitions/biohub-cell-tracking-durin
                 --epochs 50 --batch-size 16 --lr 1e-4 --amp
 ```
 
-### Evaluation:
+### Evaluation (Dual-GPU SOTA):
 ```bash
 python evaluate.py --data-dir /kaggle/input/competitions/biohub-cell-tracking-during-development/train \
-                   --volumes 6bba_05db0fb1 6bba_05b6850b
+                   --volumes 6bba_05db0fb1
+```
+
+### Production Submission Generation:
+```bash
+python submission_sota.py
 ```
