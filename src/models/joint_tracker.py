@@ -15,22 +15,37 @@ from .aniso_unet import AnisoUNet3D
 from .local_transformer import SparseLocalTrackTransformer
 
 
-def trilinear_index_features(feat_map: torch.Tensor, coords_norm: torch.Tensor) -> torch.Tensor:
+try:
+    from src.kernels.triton_ops import trilinear_index_triton, HAS_TRITON
+except ImportError:
+    try:
+        from ..kernels.triton_ops import trilinear_index_triton, HAS_TRITON
+    except ImportError:
+        HAS_TRITON = False
+
+
+def trilinear_index_features(feat_map: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
     """
     Differentiable feature sampling at continuous coordinates.
-    feat_map: (B=1, C, Z, Y, X)
-    coords_norm: (N, 3) normalized in [-1, 1] in order (X, Y, Z) for grid_sample.
-    Returns:
-        (N, C) feature vectors.
+    feat_map: (B=1, C, Z, Y, X) or (C, Z, Y, X)
+    coords:   (N, 3) continuous coordinates (z, y, x)
+    Returns:  (N, C) feature vectors.
     """
-    if coords_norm.shape[0] == 0:
-        return torch.empty((0, feat_map.shape[1]), device=feat_map.device)
+    if feat_map.dim() == 5:
+        feat_map = feat_map.squeeze(0)
+    C, Z, Y, X = feat_map.shape
+    if coords.shape[0] == 0:
+        return torch.empty((0, C), device=feat_map.device, dtype=feat_map.dtype)
 
-    # grid_sample expects (B, 1, 1, N, 3) for 5D
-    # Grid order: (x, y, z)
-    grid = coords_norm.view(1, 1, 1, -1, 3)
-    sampled = F.grid_sample(feat_map, grid, mode="bilinear", padding_mode="border", align_corners=False)
-    # sampled shape: (1, C, 1, 1, N) -> (N, C)
+    if HAS_TRITON and feat_map.is_cuda:
+        return trilinear_index_triton(feat_map, coords)
+
+    # PyTorch fallback
+    z_n = (coords[:, 0] / (Z - 1.0)) * 2.0 - 1.0
+    y_n = (coords[:, 1] / (Y - 1.0)) * 2.0 - 1.0
+    x_n = (coords[:, 2] / (X - 1.0)) * 2.0 - 1.0
+    grid = torch.stack([x_n, y_n, z_n], dim=-1).view(1, 1, 1, -1, 3)
+    sampled = F.grid_sample(feat_map.unsqueeze(0), grid, mode="bilinear", padding_mode="border", align_corners=False)
     return sampled.squeeze(0).squeeze(1).squeeze(1).t()
 
 

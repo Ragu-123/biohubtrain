@@ -168,7 +168,7 @@ class SparseLocalTrackTransformer(nn.Module):
             h_src = layer(h_src, h_tgt, mask=cand_mask_fwd)
 
         # 4. Sparse pairwise edge scoring only on candidate pairs
-        logits = torch.full((N, M), -1e4, device=feat_src.device, dtype=torch.float32)
+        logits = torch.full((N, M), -1e4, device=feat_src.device, dtype=feat_src.dtype)
         cand_indices = torch.nonzero(cand_mask_fwd, as_tuple=True)
         si, tj = cand_indices
 

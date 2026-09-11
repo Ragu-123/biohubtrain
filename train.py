@@ -167,15 +167,12 @@ def main():
                     c0_um = c0 * ds_tensor * scale
                     c1_um = c1 * ds_tensor * scale
 
-                    # Trilinear feature sampling at continuous coordinates
-                    c0_norm = normalize_coords_for_grid_sample(c0, (Z, Y, X))
-                    c1_norm = normalize_coords_for_grid_sample(c1, (Z, Y, X))
+                    # Trilinear feature sampling at continuous coordinates via Custom Triton Kernel
+                    f0_map = feats[b, 0] # (C_out, Z, Y, X)
+                    f1_map = feats[b, 1]
 
-                    f0_map = feats[b, 0:1] # (1, C_out, Z, Y, X)
-                    f1_map = feats[b, 1:2]
-
-                    f0 = trilinear_index_features(f0_map, c0_norm)
-                    f1 = trilinear_index_features(f1_map, c1_norm)
+                    f0 = trilinear_index_features(f0_map, c0)
+                    f1 = trilinear_index_features(f1_map, c1)
 
                     # Pairwise edge predictions
                     edge_logits, cand_mask = model.predict_edges(f0, c0_um, f1, c1_um)
