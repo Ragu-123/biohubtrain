@@ -19,6 +19,14 @@ from typing import Optional, Dict, Any, List
 import numpy as np
 import polars as pl
 import torch
+import sys
+for p in [
+    "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/src",
+    "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/scripts",
+]:
+    if p not in sys.path and Path(p).exists():
+        sys.path.insert(0, p)
+
 import tracksdata as td
 from geff import GeffMetadata
 

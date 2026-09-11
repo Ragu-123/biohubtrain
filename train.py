@@ -24,6 +24,13 @@ from torch.utils.data import DataLoader
 
 # Add repo to path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+for p in [
+    "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/src",
+    "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/scripts",
+]:
+    if p not in sys.path and Path(p).exists():
+        sys.path.insert(0, p)
+
 from src.models import AnisoTrack3D
 from src.training.losses import AnisoTrackingLoss
 from src.evaluation.benchmark_suite import BenchmarkSuite
