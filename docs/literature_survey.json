@@ -1,0 +1,244 @@
+[
+  {
+    "id": "2405.15700v2",
+    "title": "Trackastra: Transformer-based cell tracking for live-cell microscopy",
+    "pdf_url": "https://arxiv.org/pdf/2405.15700v2",
+    "summary": "Cell tracking is a ubiquitous image analysis task in live-cell microscopy. Unlike multiple object tracking (MOT) for natural images, cell tracking typically involves hundreds of similar-looking objects that can divide in each frame, making it a particularly challenging problem. Current state-of-the-art approaches follow the tracking-by-detection paradigm, i.e. first all cells are detected per frame and successively linked in a second step to form biologically consistent cell tracks. Linking is commonly solved via discrete optimization methods, which require manual tuning of hyperparameters for each dataset and are therefore cumbersome to use in practice. Here we propose Trackastra, a general purpose cell tracking approach that uses a simple transformer architecture to directly learn pairwise associations of cells within a temporal window from annotated data. Importantly, unlike existing transformer-based MOT pipelines, our learning architecture also accounts for dividing objects such as cells and allows for accurate tracking even with simple greedy linking, thus making strides towards removing the requirement for a complex linking step. The proposed architecture operates on the full spatio-temporal context of detections within a time window by avoiding the computational burden of processing dense images. We show that our tracking approach performs on par with or better than highly tuned state-of-the-art cell tracking algorithms for various biological datasets, such as bacteria, cell cultures and fluorescent particles. We provide code at https://github.com/weigertlab/trackastra.",
+    "published": "2024-05-24T16:44:22Z",
+    "comment": "Accepted at ECCV 2024",
+    "primary_category": "cs.CV",
+    "authors": [
+      "Benjamin Gallusser",
+      "Martin Weigert"
+    ],
+    "category_tag": "3D Cell Tracking"
+  },
+  {
+    "id": "2202.04731v2",
+    "title": "Graph Neural Network for Cell Tracking in Microscopy Videos",
+    "pdf_url": "https://arxiv.org/pdf/2202.04731v2",
+    "summary": "We present a novel graph neural network (GNN) approach for cell tracking in high-throughput microscopy videos. By modeling the entire time-lapse sequence as a direct graph where cell instances are represented by its nodes and their associations by its edges, we extract the entire set of cell trajectories by looking for the maximal paths in the graph. This is accomplished by several key contributions incorporated into an end-to-end deep learning framework. We exploit a deep metric learning algorithm to extract cell feature vectors that distinguish between instances of different biological cells and assemble same cell instances. We introduce a new GNN block type which enables a mutual update of node and edge feature vectors, thus facilitating the underlying message passing process. The message passing concept, whose extent is determined by the number of GNN blocks, is of fundamental importance as it enables the `flow' of information between nodes and edges much behind their neighbors in consecutive frames. Finally, we solve an edge classification problem and use the identified active edges to construct the cells' tracks and lineage trees. We demonstrate the strengths of the proposed cell tracking approach by applying it to 2D and 3D datasets of different cell types, imaging setups, and experimental conditions. We show that our framework outperforms current state-of-the-art methods on most of the evaluated datasets. The code is available at our repository: https://github.com/talbenha/cell-tracker-gnn.",
+    "published": "2022-02-09T21:21:48Z",
+    "comment": "Accepted to ECCV 2022",
+    "primary_category": "cs.CV",
+    "authors": [
+      "Tal Ben-Haim",
+      "Tammy Riklin Raviv"
+    ],
+    "category_tag": "3D Cell Tracking"
+  },
+  {
+    "id": "1705.03386v1",
+    "title": "Cell Tracking via Proposal Generation and Selection",
+    "pdf_url": "https://arxiv.org/pdf/1705.03386v1",
+    "summary": "Microscopy imaging plays a vital role in understanding many biological processes in development and disease. The recent advances in automation of microscopes and development of methods and markers for live cell imaging has led to rapid growth in the amount of image data being captured. To efficiently and reliably extract useful insights from these captured sequences, automated cell tracking is essential. This is a challenging problem due to large variation in the appearance and shapes of cells depending on many factors including imaging methodology, biological characteristics of cells, cell matrix composition, labeling methodology, etc. Often cell tracking methods require a sequence-specific segmentation method and manual tuning of many tracking parameters, which limits their applicability to sequences other than those they are designed for. In this paper, we propose 1) a deep learning based cell proposal method, which proposes candidates for cells along with their scores, and 2) a cell tracking method, which links proposals in adjacent frames in a graphical model using edges representing different cellular events and poses joint cell detection and tracking as the selection of a subset of cell and edge proposals. Our method is completely automated and given enough training data can be applied to a wide variety of microscopy sequences. We evaluate our method on multiple fluorescence and phase contrast microscopy sequences containing cells of various shapes and appearances from ISBI cell tracking challenge, and show that our method outperforms existing cell tracking methods.   Code is available at: https://github.com/SaadUllahAkram/CellTracker",
+    "published": "2017-05-09T15:30:39Z",
+    "primary_category": "cs.CV",
+    "authors": [
+      "Saad Ullah Akram",
+      "Juho Kannala",
+      "Lauri Eklund",
+      "Janne Heikkil\u00e4"
+    ],
+    "category_tag": "3D Cell Tracking"
+  },
+  {
+    "id": "2004.02122v1",
+    "title": "Anisotropic Convolutional Networks for 3D Semantic Scene Completion",
+    "pdf_url": "https://arxiv.org/pdf/2004.02122v1",
+    "summary": "As a voxel-wise labeling task, semantic scene completion (SSC) tries to simultaneously infer the occupancy and semantic labels for a scene from a single depth and/or RGB image. The key challenge for SSC is how to effectively take advantage of the 3D context to model various objects or stuffs with severe variations in shapes, layouts and visibility. To handle such variations, we propose a novel module called anisotropic convolution, which properties with flexibility and power impossible for the competing methods such as standard 3D convolution and some of its variations. In contrast to the standard 3D convolution that is limited to a fixed 3D receptive field, our module is capable of modeling the dimensional anisotropy voxel-wisely. The basic idea is to enable anisotropic 3D receptive field by decomposing a 3D convolution into three consecutive 1D convolutions, and the kernel size for each such 1D convolution is adaptively determined on the fly. By stacking multiple such anisotropic convolution modules, the voxel-wise modeling capability can be further enhanced while maintaining a controllable amount of model parameters. Extensive experiments on two SSC benchmarks, NYU-Depth-v2 and NYUCAD, show the superior performance of the proposed method. Our code is available at https://waterljwant.github.io/SSC/",
+    "published": "2020-04-05T07:57:02Z",
+    "primary_category": "cs.CV",
+    "authors": [
+      "Jie Li",
+      "Kai Han",
+      "Peng Wang",
+      "Yu Liu",
+      "Xia Yuan"
+    ],
+    "category_tag": "Anisotropic 3D Architectures"
+  },
+  {
+    "id": "1711.08580v2",
+    "title": "3D Anisotropic Hybrid Network: Transferring Convolutional Features from 2D Images to 3D Anisotropic Volumes",
+    "pdf_url": "https://arxiv.org/pdf/1711.08580v2",
+    "summary": "While deep convolutional neural networks (CNN) have been successfully applied for 2D image analysis, it is still challenging to apply them to 3D anisotropic volumes, especially when the within-slice resolution is much higher than the between-slice resolution and when the amount of 3D volumes is relatively small. On one hand, direct learning of CNN with 3D convolution kernels suffers from the lack of data and likely ends up with poor generalization; insufficient GPU memory limits the model size or representational power. On the other hand, applying 2D CNN with generalizable features to 2D slices ignores between-slice information. Coupling 2D network with LSTM to further handle the between-slice information is not optimal due to the difficulty in LSTM learning. To overcome the above challenges, we propose a 3D Anisotropic Hybrid Network (AH-Net) that transfers convolutional features learned from 2D images to 3D anisotropic volumes. Such a transfer inherits the desired strong generalization capability for within-slice information while naturally exploiting between-slice information for more effective modelling. The focal loss is further utilized for more effective end-to-end learning. We experiment with the proposed 3D AH-Net on two different medical image analysis tasks, namely lesion detection from a Digital Breast Tomosynthesis volume, and liver and liver tumor segmentation from a Computed Tomography volume and obtain the state-of-the-art results.",
+    "published": "2017-11-23T05:30:08Z",
+    "primary_category": "cs.CV",
+    "authors": [
+      "Siqi Liu",
+      "Daguang Xu",
+      "S. Kevin Zhou",
+      "Thomas Mertelmeier",
+      "Julia Wicklein",
+      "Anna Jerebko",
+      "Sasa Grbic",
+      "Olivier Pauly",
+      "Weidong Cai",
+      "Dorin Comaniciu"
+    ],
+    "category_tag": "Anisotropic 3D Architectures"
+  },
+  {
+    "id": "2009.01427v1",
+    "title": "Spatial Transformer Point Convolution",
+    "pdf_url": "https://arxiv.org/pdf/2009.01427v1",
+    "summary": "Point clouds are unstructured and unordered in the embedded 3D space. In order to produce consistent responses under different permutation layouts, most existing methods aggregate local spatial points through maximum or summation operation. But such an aggregation essentially belongs to the isotropic filtering on all operated points therein, which tends to lose the information of geometric structures. In this paper, we propose a spatial transformer point convolution (STPC) method to achieve anisotropic convolution filtering on point clouds. To capture and represent implicit geometric structures, we specifically introduce spatial direction dictionary to learn those latent geometric components. To better encode unordered neighbor points, we design sparse deformer to transform them into the canonical ordered dictionary space by using direction dictionary learning. In the transformed space, the standard image-like convolution can be leveraged to generate anisotropic filtering, which is more robust to express those finer variances of local regions. Dictionary learning and encoding processes are encapsulated into a network module and jointly learnt in an end-to-end manner. Extensive experiments on several public datasets (including S3DIS, Semantic3D, SemanticKITTI) demonstrate the effectiveness of our proposed method in point clouds semantic segmentation task.",
+    "published": "2020-09-03T03:12:25Z",
+    "primary_category": "cs.CV",
+    "authors": [
+      "Yuan Fang",
+      "Chunyan Xu",
+      "Zhen Cui",
+      "Yuan Zong",
+      "Jian Yang"
+    ],
+    "category_tag": "Anisotropic 3D Architectures"
+  },
+  {
+    "id": "1809.04096v1",
+    "title": "Parallel Separable 3D Convolution for Video and Volumetric Data Understanding",
+    "pdf_url": "https://arxiv.org/pdf/1809.04096v1",
+    "summary": "For video and volumetric data understanding, 3D convolution layers are widely used in deep learning, however, at the cost of increasing computation and training time. Recent works seek to replace the 3D convolution layer with convolution blocks, e.g. structured combinations of 2D and 1D convolution layers. In this paper, we propose a novel convolution block, Parallel Separable 3D Convolution (PmSCn), which applies m parallel streams of n 2D and one 1D convolution layers along different dimensions. We first mathematically justify the need of parallel streams (Pm) to replace a single 3D convolution layer through tensor decomposition. Then we jointly replace consecutive 3D convolution layers, common in modern network architectures, with the multiple 2D convolution layers (Cn). Lastly, we empirically show that PmSCn is applicable to different backbone architectures, such as ResNet, DenseNet, and UNet, for different applications, such as video action recognition, MRI brain segmentation, and electron microscopy segmentation. In all three applications, we replace the 3D convolution layers in state-of-the art models with PmSCn and achieve around 14% improvement in test performance and 40% reduction in model size and on average.",
+    "published": "2018-09-11T18:15:20Z",
+    "primary_category": "cs.CV",
+    "authors": [
+      "Felix Gonda",
+      "Donglai Wei",
+      "Toufiq Parag",
+      "Hanspeter Pfister"
+    ],
+    "category_tag": "Separable 3D Conv & Kernel Optimization"
+  },
+  {
+    "id": "1808.01556v1",
+    "title": "3D Depthwise Convolution: Reducing Model Parameters in 3D Vision Tasks",
+    "pdf_url": "https://arxiv.org/pdf/1808.01556v1",
+    "summary": "Standard 3D convolution operations require much larger amounts of memory and computation cost than 2D convolution operations. The fact has hindered the development of deep neural nets in many 3D vision tasks. In this paper, we investigate the possibility of applying depthwise separable convolutions in 3D scenario and introduce the use of 3D depthwise convolution. A 3D depthwise convolution splits a single standard 3D convolution into two separate steps, which would drastically reduce the number of parameters in 3D convolutions with more than one order of magnitude. We experiment with 3D depthwise convolution on popular CNN architectures and also compare it with a similar structure called pseudo-3D convolution. The results demonstrate that, with 3D depthwise convolutions, 3D vision tasks like classification and reconstruction can be carried out with more light-weighted neural networks while still delivering comparable performances.",
+    "published": "2018-08-05T03:50:54Z",
+    "comment": "Work in progress",
+    "primary_category": "cs.CV",
+    "authors": [
+      "Rongtian Ye",
+      "Fangyu Liu",
+      "Liqiang Zhang"
+    ],
+    "category_tag": "Separable 3D Conv & Kernel Optimization"
+  },
+  {
+    "id": "2505.24527v1",
+    "title": "Optimal Density Functions for Weighted Convolution in Learning Models",
+    "pdf_url": "https://arxiv.org/pdf/2505.24527v1",
+    "summary": "The paper introduces the weighted convolution, a novel approach to the convolution for signals defined on regular grids (e.g., 2D images) through the application of an optimal density function to scale the contribution of neighbouring pixels based on their distance from the central pixel. This choice differs from the traditional uniform convolution, which treats all neighbouring pixels equally. Our weighted convolution can be applied to convolutional neural network problems to improve the approximation accuracy. Given a convolutional network, we define a framework to compute the optimal density function through a minimisation model. The framework separates the optimisation of the convolutional kernel weights (using stochastic gradient descent) from the optimisation of the density function (using DIRECT-L). Experimental results on a learning model for an image-to-image task (e.g., image denoising) show that the weighted convolution significantly reduces the loss (up to 53% improvement) and increases the test accuracy compared to standard convolution. While this method increases execution time by 11%, it is robust across several hyperparameters of the learning model. Future work will apply the weighted convolution to real-case 2D and 3D image convolutional learning problems.",
+    "published": "2025-05-30T12:36:36Z",
+    "comment": "5 figures, 5 tables, 21 pages",
+    "primary_category": "cs.CV",
+    "authors": [
+      "Simone Cammarasana",
+      "Giuseppe Patan\u00e8"
+    ],
+    "category_tag": "Separable 3D Conv & Kernel Optimization"
+  },
+  {
+    "id": "2409.15080v1",
+    "title": "Integrating Optimal Transport and Structural Inference Models for GRN Inference from Single-cell Data",
+    "pdf_url": "https://arxiv.org/pdf/2409.15080v1",
+    "summary": "We introduce a novel gene regulatory network (GRN) inference method that integrates optimal transport (OT) with a deep-learning structural inference model. Advances in next-generation sequencing enable detailed yet destructive gene expression assays at the single-cell level, resulting in the loss of cell evolutionary trajectories. Due to technological and cost constraints, single-cell experiments often feature cells sampled at irregular and sparse time points with a small sample size. Although trajectory-based structural inference models can accurately reveal the underlying interaction graph from observed data, their efficacy depends on the inputs of thousands of regularly sampled trajectories. The irregularly-sampled nature of single-cell data precludes the direct use of these powerful models for reconstructing GRNs. Optimal transport, a classical mathematical framework that minimize transportation costs between distributions, has shown promise in multi-omics data integration and cell fate prediction. Utilizing OT, our method constructs mappings between consecutively sampled cells to form cell-level trajectories, which are given as input to a structural inference model that recovers the GRN from single-cell data. Through case studies in two synthetic datasets, we demonstrate the feasibility of our proposed method and its promising performance over eight state-of-the-art GRN inference methods.",
+    "published": "2024-09-23T14:53:27Z",
+    "comment": "for the associated code repository, see https://github.com/1250326/Integrating-OT-and-Structural-Inference-Models-for-GRN-Inference-from-Single-cell-Data",
+    "primary_category": "cs.CE",
+    "authors": [
+      "Tsz Pan Tong",
+      "Aoran Wang",
+      "George Panagopoulos",
+      "Jun Pang"
+    ],
+    "category_tag": "Graph Matching & Optimal Transport"
+  },
+  {
+    "id": "2601.21753v2",
+    "title": "Semi-discrete Optimal Transport for Time-Varying Multi-Agent Coverage Control",
+    "pdf_url": "https://arxiv.org/pdf/2601.21753v2",
+    "summary": "Coverage control algorithms have traditionally focused on static target densities, where agents optimally cover a fixed spatial distribution. However, many applications, such as environmental monitoring, surveillance, and adaptive sensing, involve time-varying densities. While time-varying coverage has been studied in Voronoi-based frameworks, extending recent optimal transport formulations of static coverage control to time-varying target densities remains an open problem. This paper presents a semi-discrete optimal transport framework for time-varying coverage control, in which agents track the first-order optimality conditions associated with minimizing the instantaneous Wasserstein distance from an evolving target density. The proposed approach is based on a coupled system of differential equations governing agent positions and the dual variables defining Laguerre regions. The resulting optimality residuals converge exponentially to zero, with global convergence established for one-dimensional domains. We also derive decentralized approximations and numerical simulations demonstrate improved tracking performance over quasi-static and Voronoi-based methods.",
+    "published": "2026-01-29T14:07:03Z",
+    "comment": "Keywords: Optimal Transport; Multi-Agent Systems; Coverage Control; Wasserstein Distance; Time-Varying Density; Autonomous Systems; Distributed Control",
+    "primary_category": "eess.SY",
+    "authors": [
+      "Italo Napolitano",
+      "Mario di Bernardo"
+    ],
+    "category_tag": "Graph Matching & Optimal Transport"
+  },
+  {
+    "id": "2502.05241v1",
+    "title": "MultistageOT: Multistage optimal transport infers trajectories from a snapshot of single-cell data",
+    "pdf_url": "https://arxiv.org/pdf/2502.05241v1",
+    "summary": "Single-cell RNA-sequencing captures a temporal slice, or a snapshot, of a cell differentiation process. A major bioinformatical challenge is the inference of differentiation trajectories from a single snapshot, and methods that account for outlier cells that are unrelated to the differentiation process have yet to be established. We present MultistageOT: a Multistage Optimal Transport-based framework for trajectory inference in a snapshot (https://github.com/dahlinlab/MultistageOT). Application of optimal transport has proven successful for many single-cell tasks, but classical bimarginal optimal transport for trajectory inference fails to model temporal progression in a snapshot. Representing a novel generalization of optimal transport, MultistageOT addresses this major limitation by introducing a temporal dimension, allowing for high resolution modeling of intermediate differentiation stages. We challenge MultistageOT with snapshot data of cell differentiation, demonstrating effectiveness in pseudotime ordering, detection of outliers, and significantly improved fate prediction accuracy over state-of-the-art.",
+    "published": "2025-02-07T12:28:25Z",
+    "primary_category": "q-bio.QM",
+    "authors": [
+      "Magnus Tronstad",
+      "Johan Karlsson",
+      "Joakim S. Dahlin"
+    ],
+    "category_tag": "Graph Matching & Optimal Transport"
+  },
+  {
+    "id": "2605.00916v1",
+    "title": "SAMamba3D: adapting Segment Anything for generalizable 3D segmentation of multiphase pore-scale images",
+    "pdf_url": "https://arxiv.org/pdf/2605.00916v1",
+    "summary": "Reliable segmentation of multiphase pore-scale X-ray images of rocks is necessary to quantify fluid saturation, connectivity, and interfacial geometry. However, current 3D segmentation methods are typically dataset-specific, requiring retraining or extensive fine-tuning whenever rock type, fluid pattern, scanner, or acquisition conditions change. Foundation models such as the Segment Anything Model (SAM) provide strong 2D boundary priors, but they are not directly applicable to 3D data.   We present SAMamba3D, a parameter-efficient framework that adapts a largely frozen SAM encoder to generalizable 3D pore-scale segmentation by coupling it with Mamba-based volumetric context modeling and progressive cross-scale feature interaction. For sandstone and carbonate datasets, with different fluids, wettability, and scanning conditions, SAMamba3D matches or outperforms current 3D baselines while reducing the need for case-specific retraining. The resulting segmented images preserve physically meaningful descriptors, including fluid saturation, connectivity, and interface morphology, enabling more reliable and rapid analysis of large 3D multiphase images.",
+    "published": "2026-04-29T15:27:15Z",
+    "comment": "Code available at https://github.com/ImperialCollegeLondon/SAMamba-3D",
+    "primary_category": "cs.CV",
+    "authors": [
+      "Rui Zhang",
+      "Xianzhi Song",
+      "Linqi Zhu",
+      "Branko Bijeljic",
+      "Gensheng Li",
+      "Martin J. Blunt"
+    ],
+    "category_tag": "State Space Models & Fast 3D"
+  },
+  {
+    "id": "2402.03526v2",
+    "title": "nnMamba: 3D Biomedical Image Segmentation, Classification and Landmark Detection with State Space Model",
+    "pdf_url": "https://arxiv.org/pdf/2402.03526v2",
+    "summary": "In the field of biomedical image analysis, the quest for architectures capable of effectively capturing long-range dependencies is paramount, especially when dealing with 3D image segmentation, classification, and landmark detection. Traditional Convolutional Neural Networks (CNNs) struggle with locality respective field, and Transformers have a heavy computational load when applied to high-dimensional medical images.In this paper, we introduce nnMamba, a novel architecture that integrates the strengths of CNNs and the advanced long-range modeling capabilities of State Space Sequence Models (SSMs). Specifically, we propose the Mamba-In-Convolution with Channel-Spatial Siamese learning (MICCSS) block to model the long-range relationship of the voxels. For the dense prediction and classification tasks, we also design the channel-scaling and channel-sequential learning methods. Extensive experiments on 6 datasets demonstrate nnMamba's superiority over state-of-the-art methods in a suite of challenging tasks, including 3D image segmentation, classification, and landmark detection. nnMamba emerges as a robust solution, offering both the local representation ability of CNNs and the efficient global context processing of SSMs, setting a new standard for long-range dependency modeling in medical image analysis. Code is available at https://github.com/lhaof/nnMamba",
+    "published": "2024-02-05T21:28:47Z",
+    "comment": "Code is available at https://github.com/lhaof/nnMamba",
+    "primary_category": "cs.CV",
+    "authors": [
+      "Haifan Gong",
+      "Luoyao Kang",
+      "Yitao Wang",
+      "Xiang Wan",
+      "Haofeng Li"
+    ],
+    "category_tag": "State Space Models & Fast 3D"
+  },
+  {
+    "id": "2408.02600v3",
+    "title": "BioMamba: Domain-Adaptive Biomedical Language Models",
+    "pdf_url": "https://arxiv.org/pdf/2408.02600v3",
+    "summary": "Background. Biomedical language models should improve performance on biomedical text while retaining general-language-modeling fluency. For Mamba-based models, this trade-off has not been systematically studied across biomedical literature and clinical text. Methods. We developed BioMamba, a family of biomedical Mamba2 models at five scales obtained by continued pretraining of released public Mamba2 checkpoints on a balanced 80%/10%/10% mixture of PubMed abstracts, the Colossal Clean Crawled Corpus (C4), and Wikipedia. The contribution is the adaptation recipe and the accompanying open-weight checkpoints.   Results. Across five scales, BioMamba consistently lowered PubMed perplexity, improved Wikipedia-style held-out perplexity by 1.46-4.72 PPL, and left C4 perplexity essentially unchanged. On six out-of-domain multiple-choice benchmarks, BioMamba stayed within +/-3 percentage points of Mamba2 with no systematic regression. After supervised fine-tuning, BioMamba+SFT matched or exceeded Mamba2+SFT on MIMIC-IV note completion and discharge summary generation at every evaluated scale, and improved PubMedQA at every scale. The strongest model (BioMamba-2.7B) reached a PubMed perplexity of 5.28 and accuracies of 90.24% and 73.00% on BioASQ and PubMedQA, respectively.   Conclusions. A balanced domain-adaptive continued pretraining recipe strengthens Mamba2 language models on biomedical literature and clinical text while preserving general-language-modeling fluency.",
+    "published": "2024-08-05T16:21:36Z",
+    "primary_category": "cs.CL",
+    "doi": "10.34133/hds.0454",
+    "authors": [
+      "Ling Yue",
+      "Mingzhi Zhu",
+      "Sixue Xing",
+      "Yunning Cao",
+      "Yanbo Wang",
+      "Shimin Shan",
+      "Jinfei Liu",
+      "Vijil Chenthamarakshan",
+      "Shaowu Pan",
+      "Payel Das",
+      "Tianfan Fu"
+    ],
+    "category_tag": "State Space Models & Fast 3D"
+  }
+]

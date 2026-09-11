@@ -1,0 +1,26 @@
+{
+  "architecture": "AnisoTrack3D",
+  "spatial_decomposition": "lateral_1x3x3_axial_3x1x1",
+  "depthwise_separable": true,
+  "unet_layers": [
+    32,
+    64,
+    128
+  ],
+  "unet_out_channels": 32,
+  "downsample": [
+    1,
+    4,
+    4
+  ],
+  "window_size": 2,
+  "r_max_um": 12.0,
+  "transformer_d_model": 64,
+  "transformer_layers": 3,
+  "learning_rate": 0.0001,
+  "batch_size": 16,
+  "det_loss_weight": 1.0,
+  "det_neg_weight": 0.01,
+  "subvoxel_loss_weight": 0.5,
+  "amp_enabled": true
+}
