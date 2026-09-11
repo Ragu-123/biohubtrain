@@ -50,7 +50,7 @@ def pool_kernel_from_um(um: float, voxel_size: tuple[float, ...]) -> tuple[int, 
     return tuple(kernel)
 
 
-def extract_pos_features(coords: np.ndarray, image_shape: tuple[int, ...], pos_embed_dim: int = 16) -> np.ndarray:
+def extract_pos_features(coords: np.ndarray, image_shape: tuple[int, ...], pos_embed_dim: int = 8) -> np.ndarray:
     shape_t = np.array(image_shape, dtype=np.float32)
     norms = coords / np.maximum(shape_t, 1.0)
     freqs = (2.0 ** np.arange(pos_embed_dim // 2, dtype=np.float32)) * np.pi
