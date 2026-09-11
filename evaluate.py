@@ -314,8 +314,23 @@ def track_volume(
                     dist_m_d1 = float(np.linalg.norm(p_src_um - d1_um))
                     symmetry_ratio = abs(dist_m_d1 - dist_um) / (dist_m_d1 + dist_um + 1e-6)
 
-                    # Biological Cytokinesis Constraints
-                    if dist_um > 8.50 or dist_sisters > 15.30 or symmetry_ratio > 0.40:
+                    # Physical laws of cytokinesis spindle:
+                    # 1. Daughters diverge along opposing spindle poles (cos_spindle <= -0.65)
+                    # 2. Mother sits near the spindle equator/midpoint (midpoint_offset <= 2.5 um)
+                    # 3. Spindle sister distance <= 15.34 um
+                    # 4. Spindle symmetry ratio <= 0.60
+                    v_d1 = d1_um - p_src_um
+                    v_d2 = p_tgt_um - p_src_um
+                    cos_spindle = float(np.dot(v_d1, v_d2) / (dist_m_d1 * dist_um + 1e-6))
+                    midpoint_offset = float(np.linalg.norm(p_src_um - 0.5 * (d1_um + p_tgt_um)))
+
+                    if (
+                        dist_um > 8.54
+                        or dist_sisters > 15.34
+                        or symmetry_ratio > 0.60
+                        or cos_spindle > -0.65
+                        or midpoint_offset > 2.50
+                    ):
                         continue
 
                     gi, gj = int(idx_src[i]), int(idx_tgt[j])
