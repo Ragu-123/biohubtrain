@@ -35,25 +35,31 @@ class AnisoTrackingLoss(nn.Module):
         if not mask.any():
             return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
-        probs = torch.softmax(logits, dim=0) # dim=0: target chooses source
-        bce = F.binary_cross_entropy(probs, target, reduction="none")
-        p_t = probs * target + (1.0 - probs) * (1.0 - target)
-        focal_weight = (1.0 - p_t) ** self.focal_gamma
+        with torch.amp.autocast('cuda', enabled=False):
+            logits_f = logits.float()
+            target_f = target.float()
+            probs = torch.softmax(logits_f, dim=0).clamp(min=1e-7, max=1.0 - 1e-7)
+            bce = F.binary_cross_entropy(probs, target_f, reduction="none")
+            p_t = probs * target_f + (1.0 - probs) * (1.0 - target_f)
+            focal_weight = (1.0 - p_t) ** self.focal_gamma
 
-        div_rows = target.sum(dim=1) > 1
-        div_mult = torch.ones_like(bce)
-        div_mult[div_rows] = 1.2
+            div_rows = target_f.sum(dim=1) > 1
+            div_mult = torch.ones_like(bce)
+            div_mult[div_rows] = 1.2
 
-        return (focal_weight * bce * div_mult)[mask].mean()
+            return (focal_weight * bce * div_mult)[mask].mean()
 
     def detection_loss(self, det_logits: torch.Tensor, gt_peak_mask: torch.Tensor) -> torch.Tensor:
-        pos_mask = gt_peak_mask > 0.5
-        n_pos = pos_mask.sum().clamp(min=1.0)
-        n_neg = (~pos_mask).sum().clamp(min=1.0)
+        with torch.amp.autocast('cuda', enabled=False):
+            det_f = det_logits.float().view(-1)
+            gt_f = gt_peak_mask.float().view(-1)
+            pos_mask = gt_f > 0.5
+            n_pos = pos_mask.sum().clamp(min=1.0)
+            n_neg = (~pos_mask).sum().clamp(min=1.0)
 
-        weight = torch.where(pos_mask, 1.0 / n_pos, (self.det_neg_weight / n_neg))
-        bce = F.binary_cross_entropy_with_logits(det_logits, gt_peak_mask, weight=weight, reduction="sum")
-        return bce
+            weight = torch.where(pos_mask, 1.0 / n_pos, (self.det_neg_weight / n_neg))
+            bce = F.binary_cross_entropy_with_logits(det_f, gt_f, weight=weight, reduction="sum")
+            return bce
 
     def subvoxel_loss(self, pred_deltas: torch.Tensor, target_deltas: torch.Tensor, peak_mask: torch.Tensor) -> torch.Tensor:
         if peak_mask.sum() == 0:
