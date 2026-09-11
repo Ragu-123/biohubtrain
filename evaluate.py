@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 """
-AnisoTrack3D Production Evaluation & Benchmarking Pipeline.
+AnisoTrack3D-Ensemble: Production Evaluation & Benchmarking Pipeline.
 Integrates:
-1. AnisoUNet3D Anisotropic Spatial-Axial Separable Backbone
-2. Custom Triton Continuous 2nd-Order Sub-Voxel Peak Refiner
-3. Custom Triton Continuous Trilinear Feature Sampler
-4. SparseLocalTrackTransformer Local Candidate Ball Attention (R <= 12.0 um)
-5. Joint-Probability Mitosis Recovery with Cytokinesis Spindle Geometry Gating
-6. Official Competition Metric Evaluation (Adjusted Edge Jaccard, Division Jaccard, Combined Score)
+1. Multi-Checkpoint Consensus Ensemble across Dual GPUs (Split 0 + Split 1 + Seed 314159)
+2. Custom Triton Continuous 3D Regularized Hessian Sub-Voxel Peak Refinement
+3. Directional Kinematic Momentum Buffer (Astra Q6)
+4. Bidirectional Harmonic Consensus with Soft-Veto (Forward-Backward Softmax)
+5. Physical Cytokinesis Spindle Collinearity & Equatorial Midpoint Geometry (Astra Q2)
+6. Internal Gap-Protected Short-Track Pruning (Astra Q1)
+7. Adaptive Census Multiplier Calibration (Astra Q5)
+8. Official Competition Metric Evaluation (Adjusted Edge Jaccard, Division Jaccard, Combined Score)
 
 Usage:
     python evaluate.py --data-dir /kaggle/input/competitions/biohub-cell-tracking-during-development/train \
@@ -18,12 +20,14 @@ import argparse
 import sys
 import time
 from pathlib import Path
+from typing import Sequence
 
 import numpy as np
 import polars as pl
 import torch
 import torch.nn.functional as F
 import zarr
+import rustworkx as rx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 for p in [
@@ -86,9 +90,82 @@ def build_tracksdata_graph(coords: np.ndarray, edges: list[tuple[int, int, float
     return graph
 
 
+def filter_short_tracks_with_gaps(
+    coords: np.ndarray,
+    edges: list[tuple[int, int, float, float]],
+    min_length: int = 4,
+    scale: tuple[float, ...] = (1.625, 0.40625, 0.40625),
+    max_gap_dist_um: float = 12.0,
+    total_frames: int = 100,
+) -> tuple[np.ndarray, list[tuple[int, int, float, float]]]:
+    """
+    Astra Q1 Recommendation: Protect track fragments across 1-frame dropouts
+    without exporting illegal skip edges.
+    1. Form internal graph with dt=2 gap hypotheses.
+    2. Compute combined temporal support of connected components.
+    3. Retain nodes in components with support >= min_length or touching movie boundaries.
+    4. Export strictly valid dt=1 edges.
+    """
+    if min_length <= 1 or len(edges) == 0:
+        return coords, edges
+
+    N = len(coords)
+    rx_g = rx.PyDiGraph()
+    rx_g.add_nodes_from(range(N))
+    for src, tgt, prob, dist in edges:
+        rx_g.add_edge(src, tgt, None)
+
+    endpoints = [n for n in range(N) if rx_g.out_degree(n) == 0 and rx_g.in_degree(n) > 0]
+    startpoints = [n for n in range(N) if rx_g.in_degree(n) == 0 and rx_g.out_degree(n) > 0]
+    t_coords = coords[:, 0]
+
+    starts_by_t: dict[int, list[int]] = {}
+    for sp in startpoints:
+        t_sp = int(t_coords[sp])
+        starts_by_t.setdefault(t_sp, []).append(sp)
+
+    scale_arr = np.array(scale, dtype=np.float32)
+    coords_um = coords[:, 1:] * scale_arr
+
+    internal_gap_edges = []
+    for ep in endpoints:
+        t_ep = int(t_coords[ep])
+        t_cand = t_ep + 2  # 1-frame optical dropout
+        if t_cand in starts_by_t:
+            p_ep = coords_um[ep]
+            for sp in starts_by_t[t_cand]:
+                p_sp = coords_um[sp]
+                d = np.linalg.norm(p_ep - p_sp)
+                if d <= max_gap_dist_um:
+                    internal_gap_edges.append((ep, sp))
+
+    # Construct unified internal graph
+    undir_g = rx.PyGraph()
+    undir_g.add_nodes_from(range(N))
+    for src, tgt, prob, dist in edges:
+        undir_g.add_edge(src, tgt, None)
+    for ep, sp in internal_gap_edges:
+        undir_g.add_edge(ep, sp, None)
+
+    comps = rx.connected_components(undir_g)
+    surviving_nodes = set()
+    for comp in comps:
+        comp_frames = set(coords[n, 0] for n in comp)
+        if len(comp_frames) >= min_length or 0 in comp_frames or (total_frames - 1) in comp_frames:
+            surviving_nodes.update(comp)
+
+    # Export strictly valid dt=1 edges whose endpoints survive
+    new_edges = [(s, t, p, d) for s, t, p, d in edges if s in surviving_nodes and t in surviving_nodes]
+    new_node_ids = sorted(list(surviving_nodes))
+    old_to_new = {old: new for new, old in enumerate(new_node_ids)}
+    filtered_coords = coords[new_node_ids]
+    remapped_edges = [(old_to_new[s], old_to_new[t], p, d) for s, t, p, d in new_edges]
+    return filtered_coords, remapped_edges
+
+
 @torch.no_grad()
 def track_volume(
-    model,
+    models: Sequence[tuple[torch.nn.Module, torch.device]] | torch.nn.Module,
     volume_dir: Path,
     device: torch.device,
     downsample: tuple[int, int, int] = (1, 4, 4),
@@ -101,10 +178,23 @@ def track_volume(
     det_tta: bool = True,
     max_frames: int | None = None,
     n_total: float | None = None,
+    min_track_length: int = 4,
 ) -> tuple[td.graph.InMemoryGraph, float, float]:
+    """
+    Tracks an entire 4D light-sheet volume using AnisoTrack3D-Ensemble.
+    Supports single-model or multi-checkpoint ensemble across Dual GPUs.
+    """
     t0 = time.perf_counter()
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(device)
+
+    # Standardize models list
+    if not isinstance(models, (list, tuple)):
+        model_list = [(models, device)]
+    else:
+        model_list = list(models)
+
+    primary_device = device
 
     ds = open_dataset(volume_dir, normalize=False, load_image=False, downsample=downsample)
     z_path = volume_dir if volume_dir.suffix == ".zarr" else volume_dir.with_suffix(".zarr")
@@ -118,7 +208,6 @@ def track_volume(
     scale = tuple(ds.scale)
 
     ds_arr = np.array(downsample, dtype=np.float32)
-    ds_arr_t = torch.from_numpy(ds_arr).to(device)
 
     voxel_size_down = tuple(s * d for s, d in zip(scale, downsample))
     pool_k = pool_kernel_from_um(pool_kernel_um, voxel_size_down)
@@ -138,41 +227,54 @@ def track_volume(
         if not window_starts or last != window_starts[-1]:
             window_starts.append(last)
 
-    # Adaptive Census Multiplier & Kinematic Momentum Buffer (Astra Recommendations)
-    velocity_buffer = {}  # global_node_id -> np.ndarray 3D velocity in microns
+    # Directional Kinematic Momentum Buffer (Astra Q6)
+    velocity_buffer: dict[int, np.ndarray] = {}
 
     for ws in window_starts:
         frame_indices = list(range(ws, ws + window_size))
-        imgs = []
+        imgs_raw = []
         for t in frame_indices:
             dz, dy, dx = downsample
             raw = zarr_arr[t, ::dz, ::dy, ::dx].astype(np.float32)
             f_t = torch.from_numpy(raw)
             if list(f_t.shape) != target_shape:
                 f_t = F.interpolate(f_t[None, None], size=target_shape, mode="trilinear", align_corners=False)[0, 0]
-            imgs.append(f_t)
+            imgs_raw.append(f_t)
 
-        imgs = torch.stack(imgs)
-        imgs = ((imgs - q_low) / (q_high - q_low + 1e-6)).clamp(0.0).unsqueeze(0).to(device)
+        imgs_raw = torch.stack(imgs_raw)
+        imgs_raw = ((imgs_raw - q_low) / (q_high - q_low + 1e-6)).clamp(0.0).unsqueeze(0)
 
-        with torch.no_grad():
-            unet_out, det_logits = model.encode(imgs)
+        # Multi-model feature extraction & detection logits
+        unet_outs = []
+        det_logits_list = []
 
-            if det_tta:
-                tta_flips = [(-1,), (-2,), (-2, -1)]
-                for dims in tta_flips:
-                    imgs_flip = imgs.flip(dims)
-                    _, det_flip = model.encode(imgs_flip)
+        for m, dev in model_list:
+            inp = imgs_raw.to(dev)
+            with torch.no_grad():
+                u_out, d_log = m.encode(inp)
+                if det_tta:
+                    tta_flips = [(-1,), (-2,), (-2, -1)]
+                    for dims in tta_flips:
+                        inp_flip = inp.flip(dims)
+                        _, d_flip = m.encode(inp_flip)
+                        for f in range(window_size):
+                            d_log[f] = d_log[f] + d_flip[f].flip(dims)
+                        del inp_flip, d_flip
                     for f in range(window_size):
-                        det_logits[f] = det_logits[f] + det_flip[f].flip(dims)
-                    del imgs_flip, det_flip
-                for f in range(window_size):
-                    det_logits[f] = det_logits[f] / 4
+                        d_log[f] = d_log[f] / 4.0
+            unet_outs.append(u_out)
+            det_logits_list.append([dl.to(primary_device) for dl in d_log])
 
-        # Cell Detection + Custom Triton 3D Regularized Hessian Sub-Voxel Peak Refinement
+        # Consensus Ensemble Detection Heatmap
+        det_logits_ens = []
+        for f in range(window_size):
+            avg_dl = sum(det_logits_list[k][f] for k in range(len(model_list))) / len(model_list)
+            det_logits_ens.append(avg_dl)
+
+        # Cell Detection + Triton 3D Regularized Hessian Sub-Voxel Peak Refinement
         for f_idx, t in enumerate(frame_indices):
             if t not in seen_frames:
-                log_t = det_logits[f_idx]
+                log_t = det_logits_ens[f_idx]
                 pooled = F.max_pool3d(log_t, pool_k, stride=1, padding=pad)
                 sig_t = torch.sigmoid(log_t)
                 is_peak = (log_t == pooled) & (sig_t > det_threshold)
@@ -181,7 +283,7 @@ def track_volume(
                 if len(peak_idx) > 0:
                     peak_scores = sig_t[0, 0, peak_idx[:, 0], peak_idx[:, 1], peak_idx[:, 2]]
 
-                    # Adaptive Census Calibration (Q5: N_target = N_est * 1.05)
+                    # Adaptive Census Multiplier Calibration (Astra Q5: N_target = N_est * 1.05)
                     if n_total is not None and not np.isnan(n_total) and n_total > 0:
                         n_frame_max = int((n_total * 1.05) / T)
                         if len(peak_idx) > n_frame_max:
@@ -201,7 +303,7 @@ def track_volume(
 
         coords_down_so_far = np.concatenate(coord_lists_down) if coord_lists_down else np.empty((0, 4), dtype=np.float32)
 
-        # Edge Association with Kinematic Momentum Buffer & Mitosis Gating
+        # Multi-model Edge Association
         for f_idx in range(window_size - 1):
             t_src, t_tgt = frame_indices[f_idx], frame_indices[f_idx + 1]
             if (t_src, t_tgt) in seen_pairs:
@@ -219,33 +321,45 @@ def track_volume(
             idx_src = np.arange(s_src, e_src, dtype=np.int64)
             idx_tgt = np.arange(s_tgt, e_tgt, dtype=np.int64)
 
-            p_coords_src = torch.from_numpy(c_src_down[:, 1:].astype(np.float32)).unsqueeze(0).to(device)
-            p_coords_tgt = torch.from_numpy(c_tgt_down[:, 1:].astype(np.float32)).unsqueeze(0).to(device)
-
             window_shape = (window_size,) + ds.image_shape[1:]
             c_src_rel = c_src_down.copy()
             c_src_rel[:, 0] = f_idx
             c_tgt_rel = c_tgt_down.copy()
             c_tgt_rel[:, 0] = f_idx + 1
-            p_pos_src = torch.from_numpy(extract_pos_features(c_src_rel, window_shape)).unsqueeze(0).to(device)
-            p_pos_tgt = torch.from_numpy(extract_pos_features(c_tgt_rel, window_shape)).unsqueeze(0).to(device)
-            p_mask_src = torch.ones(1, n_src, dtype=torch.bool, device=device)
-            p_mask_tgt = torch.ones(1, n_tgt, dtype=torch.bool, device=device)
+            pos_src_np = extract_pos_features(c_src_rel, window_shape)
+            pos_tgt_np = extract_pos_features(c_tgt_rel, window_shape)
 
-            with torch.no_grad():
-                unet_feat_src = model._index_features(unet_out[:, f_idx], p_coords_src, p_mask_src)
-                unet_feat_tgt = model._index_features(unet_out[:, f_idx + 1], p_coords_tgt, p_mask_tgt)
-                edge_logits_pair = model.predict_edges(
-                    unet_feat_src, unet_feat_tgt,
-                    p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
-                    p_pos_src, p_pos_tgt,
-                    p_mask_src, p_mask_tgt,
-                )
+            edge_logits_models = []
+            for k, (m, dev) in enumerate(model_list):
+                u_out = unet_outs[k]
+                p_coords_src = torch.from_numpy(c_src_down[:, 1:].astype(np.float32)).unsqueeze(0).to(dev)
+                p_coords_tgt = torch.from_numpy(c_tgt_down[:, 1:].astype(np.float32)).unsqueeze(0).to(dev)
+                p_pos_src = torch.from_numpy(pos_src_np).unsqueeze(0).to(dev)
+                p_pos_tgt = torch.from_numpy(pos_tgt_np).unsqueeze(0).to(dev)
+                p_mask_src = torch.ones(1, n_src, dtype=torch.bool, device=dev)
+                p_mask_tgt = torch.ones(1, n_tgt, dtype=torch.bool, device=dev)
+                ds_arr_t = torch.from_numpy(ds_arr).to(dev)
 
-            raw = edge_logits_pair[0]
-            probs = torch.softmax(raw, dim=0).cpu().numpy()
+                with torch.no_grad():
+                    u_feat_src = m._index_features(u_out[:, f_idx], p_coords_src, p_mask_src)
+                    u_feat_tgt = m._index_features(u_out[:, f_idx + 1], p_coords_tgt, p_mask_tgt)
+                    el = m.predict_edges(
+                        u_feat_src, u_feat_tgt,
+                        p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
+                        p_pos_src, p_pos_tgt,
+                        p_mask_src, p_mask_tgt,
+                    )[0].to(primary_device)
+                edge_logits_models.append(el)
 
-            # Directional Momentum Scoring (Astra Q6)
+            # Consensus Ensemble Edge Logits
+            edge_logits_ens = sum(edge_logits_models) / len(edge_logits_models)
+
+            # Bidirectional Consensus Soft-Veto (Forward-Backward Softmax)
+            probs_bwd = torch.softmax(edge_logits_ens, dim=0).cpu().numpy()
+            probs_fwd = torch.softmax(edge_logits_ens, dim=1).cpu().numpy()
+            probs = 0.85 * probs_bwd + 0.15 * probs_fwd
+
+            # Directional Momentum Candidate Scoring
             candidates = []
             for i in range(n_src):
                 gi = int(idx_src[i])
@@ -262,11 +376,10 @@ def track_volume(
                     v_curr = p_tgt_um - p_src_um
                     speed_curr = float(np.linalg.norm(v_curr))
 
-                    # Momentum directional persistence bonus
+                    # Directional momentum persistence
                     if v_prev is not None and speed_prev > 1e-3 and speed_curr > 1e-3:
                         cos_theta = float(np.dot(v_prev, v_curr) / (speed_prev * speed_curr + 1e-6))
                         delta_speed = abs(speed_curr - speed_prev)
-                        # Astra formulation: alpha * cos(theta) - beta * delta_speed / 10.0
                         momentum_bonus = 0.08 * cos_theta - 0.02 * (delta_speed / 10.0)
                         effective_score = p_ij + momentum_bonus
                     else:
@@ -304,7 +417,7 @@ def track_volume(
                     mother_d1_prob[i] = raw_prob
                     velocity_buffer[gj] = v_curr
 
-                # Secondary edge (division)
+                # Secondary edge (cytokinesis division)
                 elif n_ch == 1:
                     if (mother_d1_prob[i] + raw_prob) < div_joint_threshold or raw_prob < div_threshold:
                         continue
@@ -314,11 +427,11 @@ def track_volume(
                     dist_m_d1 = float(np.linalg.norm(p_src_um - d1_um))
                     symmetry_ratio = abs(dist_m_d1 - dist_um) / (dist_m_d1 + dist_um + 1e-6)
 
-                    # Physical laws of cytokinesis spindle:
-                    # 1. Daughters diverge along opposing spindle poles (cos_spindle <= -0.65)
-                    # 2. Mother sits near the spindle equator/midpoint (midpoint_offset <= 2.5 um)
-                    # 3. Spindle sister distance <= 15.34 um
-                    # 4. Spindle symmetry ratio <= 0.60
+                    # Physical laws of cytokinesis spindle (calibrated to anisotropic light-sheet):
+                    # 1. Opposing spindle poles (cos_spindle <= -0.15)
+                    # 2. Mother near spindle equator (midpoint_offset <= 4.50 um)
+                    # 3. Sister distance <= 15.34 um
+                    # 4. Branch symmetry <= 0.85
                     v_d1 = d1_um - p_src_um
                     v_d2 = p_tgt_um - p_src_um
                     cos_spindle = float(np.dot(v_d1, v_d2) / (dist_m_d1 * dist_um + 1e-6))
@@ -327,9 +440,9 @@ def track_volume(
                     if (
                         dist_um > 8.54
                         or dist_sisters > 15.34
-                        or symmetry_ratio > 0.60
-                        or cos_spindle > -0.65
-                        or midpoint_offset > 2.50
+                        or symmetry_ratio > 0.85
+                        or cos_spindle > -0.15
+                        or midpoint_offset > 4.50
                     ):
                         continue
 
@@ -343,35 +456,72 @@ def track_volume(
     coords_orig = coords_down.copy()
     coords_orig[:, 1:] *= ds_arr
 
-    latency_sec = time.perf_counter() - t0
-    peak_vram_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2) if torch.cuda.is_available() else 0.0
+    # Apply Astra's Internal Gap-Protected Short-Track Pruning
+    if min_track_length > 1:
+        coords_clean, edges_clean = filter_short_tracks_with_gaps(
+            coords_orig, all_edges, min_length=min_track_length, scale=scale, total_frames=T
+        )
+    else:
+        coords_clean, edges_clean = coords_orig, all_edges
 
-    pred_graph = build_tracksdata_graph(coords_orig, all_edges)
+    latency_sec = time.perf_counter() - t0
+    peak_vram_mb = torch.cuda.max_memory_allocated(primary_device) / (1024 ** 2) if torch.cuda.is_available() else 0.0
+
+    pred_graph = build_tracksdata_graph(coords_clean, edges_clean)
     return pred_graph, latency_sec, peak_vram_mb
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AnisoTrack3D Production Benchmark Evaluation")
+    parser = argparse.ArgumentParser(description="AnisoTrack3D-Ensemble Production Benchmark Evaluation")
     parser.add_argument("--data-dir", type=str, required=True, help="Path to train directory with .zarr and .geff")
-    parser.add_argument("--weights", type=str, default="/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth", help="Path to weights (.pth)")
+    parser.add_argument("--weights", nargs="+", default=[
+        "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth",
+        "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth",
+        "/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
+    ], help="List of model weight paths to ensemble")
     parser.add_argument("--volumes", nargs="+", default=["6bba_05db0fb1"], help="List of volume names to benchmark")
     parser.add_argument("--det-thresh", type=float, default=0.50, help="Detection threshold")
     parser.add_argument("--edge-thresh", type=float, default=0.48, help="Edge threshold")
+    parser.add_argument("--min-length", type=int, default=4, help="Minimum track length filter with internal gap protection")
     parser.add_argument("--det-tta", action="store_true", default=True, help="Use flip-xy TTA for detection")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit frames for fast test")
     args = parser.parse_args()
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device_0 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device_1 = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
+
     print("=" * 85)
-    print("           ANISOTRACK3D PRODUCTION BENCHMARK EVALUATION HARNESS")
+    print("      ANISOTRACK3D-ENSEMBLE PRODUCTION BENCHMARK EVALUATION HARNESS")
     print("=" * 85)
     print(f"  Target Volumes : {args.volumes}")
-    print(f"  Device         : {device} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+    print(f"  Primary Device : {device_0} ({torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'})")
+    if torch.cuda.device_count() > 1:
+        print(f"  Secondary Dev  : {device_1} ({torch.cuda.get_device_name(1)})")
     print(f"  Custom Triton  : {'ENABLED' if HAS_TRITON else 'DISABLED'}")
+    print(f"  Min Track Len  : {args.min_length} (with Astra internal gap protection)")
     print("=" * 85)
 
     from predict_unet_transformer import load_model
-    model, window_size, downsample = load_model(Path(args.weights), device)
+
+    loaded_models = []
+    downsample = (1, 4, 4)
+    window_size = 2
+
+    for idx, w_path in enumerate(args.weights):
+        p = Path(w_path)
+        if not p.exists():
+            print(f"  [Warning] Weight path not found: {p}, skipping...")
+            continue
+        dev = device_1 if (idx % 2 == 1 and torch.cuda.device_count() > 1) else device_0
+        print(f"  Loading Model {idx + 1} on {dev}: {p.name}")
+        m, window_size, downsample = load_model(p, dev)
+        loaded_models.append((m, dev))
+
+    if not loaded_models:
+        raise RuntimeError("No model weights could be loaded! Please check paths.")
+
+    print(f"  Successfully loaded {len(loaded_models)} model(s) for consensus ensemble.")
+    print("=" * 85)
 
     suite = BenchmarkSuite(train_dir=Path(args.data_dir), max_matching_distance_um=7.0)
     results = []
@@ -385,9 +535,9 @@ def main():
             n_total = None
 
         pred_graph, latency_sec, peak_vram_mb = track_volume(
-            model=model,
+            models=loaded_models,
             volume_dir=vol_path,
-            device=device,
+            device=device_0,
             downsample=downsample,
             window_size=window_size,
             det_threshold=args.det_thresh,
@@ -395,6 +545,7 @@ def main():
             det_tta=args.det_tta,
             max_frames=args.max_frames,
             n_total=n_total,
+            min_track_length=args.min_length,
         )
 
         res = suite.evaluate_graph(
