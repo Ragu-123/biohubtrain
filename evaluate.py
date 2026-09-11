@@ -8,8 +8,9 @@ Integrates:
 4. Bidirectional Harmonic Consensus with Soft-Veto (Forward-Backward Softmax)
 5. Physical Cytokinesis Spindle Collinearity & Equatorial Midpoint Geometry (Astra Q2)
 6. Internal Gap-Protected Short-Track Pruning (Astra Q1)
-7. Adaptive Census Multiplier Calibration (Astra Q5)
-8. Official Competition Metric Evaluation (Adjusted Edge Jaccard, Division Jaccard, Combined Score)
+7. Consecutive Endpoint Reconnection (Astra Q1 / Q2)
+8. Degree-0 Isolated Node Pruning & Adaptive Census Multiplier Calibration (Astra Q5)
+9. Official Competition Metric Evaluation (Adjusted Edge Jaccard, Division Jaccard, Combined Score)
 
 Usage:
     python evaluate.py --data-dir /kaggle/input/competitions/biohub-cell-tracking-during-development/train \
@@ -101,10 +102,6 @@ def filter_short_tracks_with_gaps(
     """
     Astra Q1 Recommendation: Protect track fragments across 1-frame dropouts
     without exporting illegal skip edges.
-    1. Form internal graph with dt=2 gap hypotheses.
-    2. Compute combined temporal support of connected components.
-    3. Retain nodes in components with support >= min_length or touching movie boundaries.
-    4. Export strictly valid dt=1 edges.
     """
     if min_length <= 1 or len(edges) == 0:
         return coords, edges
@@ -161,6 +158,146 @@ def filter_short_tracks_with_gaps(
     filtered_coords = coords[new_node_ids]
     remapped_edges = [(old_to_new[s], old_to_new[t], p, d) for s, t, p, d in new_edges]
     return filtered_coords, remapped_edges
+
+
+def prune_false_divisions(
+    coords: np.ndarray,
+    edges: list[tuple[int, int, float, float]],
+    scale: tuple[float, ...],
+    cos_spindle_thresh: float = -0.15,
+    midpoint_thresh: float = 4.50,
+    min_prob: float = 0.45,
+) -> list[tuple[int, int, float, float]]:
+    """
+    Prune spurious second-daughter edges from non-dividing cells that cause division FPs.
+    """
+    if not edges:
+        return edges
+
+    rx_g = rx.PyDiGraph()
+    rx_g.add_nodes_from(range(len(coords)))
+    edge_dict = {}
+    for src, tgt, prob, dist in edges:
+        rx_g.add_edge(src, tgt, None)
+        edge_dict[(src, tgt)] = (prob, dist)
+
+    scale_arr = np.array(scale, dtype=np.float32)
+    coords_um = coords[:, 1:] * scale_arr
+
+    edges_to_remove = set()
+    for d in range(len(coords)):
+        succs = rx_g.successors(d)
+        if len(succs) < 2:
+            continue
+        preds = rx_g.predecessors(d)
+
+        # Rule 1: Mother must have incoming edge (established tracklet)
+        if len(preds) == 0:
+            probs = [edge_dict[(d, s)][0] for s in succs]
+            weaker_child = succs[int(np.argmin(probs))]
+            edges_to_remove.add((d, weaker_child))
+            continue
+
+        probs = [edge_dict[(d, s)][0] for s in succs]
+        if min(probs) < min_prob:
+            weaker_child = succs[int(np.argmin(probs))]
+            edges_to_remove.add((d, weaker_child))
+            continue
+
+        p_m = coords_um[d]
+        p_d1 = coords_um[succs[0]]
+        p_d2 = coords_um[succs[1]]
+
+        v1 = p_d1 - p_m
+        v2 = p_d2 - p_m
+        d1 = np.linalg.norm(v1)
+        d2 = np.linalg.norm(v2)
+
+        cos_spindle = np.dot(v1, v2) / (d1 * d2 + 1e-6)
+        midpoint_offset = np.linalg.norm(p_m - 0.5 * (p_d1 + p_d2))
+
+        if cos_spindle > cos_spindle_thresh or midpoint_offset > midpoint_thresh:
+            weaker_child = succs[int(np.argmin(probs))]
+            edges_to_remove.add((d, weaker_child))
+
+    clean_edges = [e for e in edges if (e[0], e[1]) not in edges_to_remove]
+    return clean_edges
+
+
+def reconnect_broken_consecutive_endpoints(
+    coords: np.ndarray,
+    edges: list[tuple[int, int, float, float]],
+    scale: tuple[float, ...],
+    max_reconnect_dist_um: float = 6.5,
+) -> list[tuple[int, int, float, float]]:
+    """
+    Consecutive-frame endpoint reconnection (t -> t+1):
+    Heals valid tracks where transient noise peaks were pruned, leaving true dividers
+    or parents disconnected from their targets. Strictly dt = 1.
+    """
+    if not edges:
+        return edges
+
+    N = len(coords)
+    rx_g = rx.PyDiGraph()
+    rx_g.add_nodes_from(range(N))
+    for src, tgt, prob, dist in edges:
+        rx_g.add_edge(src, tgt, None)
+
+    endpoints = [n for n in range(N) if rx_g.out_degree(n) == 0]
+    startpoints = [n for n in range(N) if rx_g.in_degree(n) == 0]
+
+    t_coords = coords[:, 0]
+    starts_by_t: dict[int, list[int]] = {}
+    for sp in startpoints:
+        t_sp = int(t_coords[sp])
+        starts_by_t.setdefault(t_sp, []).append(sp)
+
+    scale_arr = np.array(scale, dtype=np.float32)
+    coords_um = coords[:, 1:] * scale_arr
+
+    new_reconnect_edges = []
+    claimed_starts = set()
+
+    for ep in endpoints:
+        t_ep = int(t_coords[ep])
+        t_next = t_ep + 1
+        if t_next in starts_by_t:
+            p_ep = coords_um[ep]
+            best_sp = None
+            best_d = float("inf")
+            for sp in starts_by_t[t_next]:
+                if sp in claimed_starts:
+                    continue
+                p_sp = coords_um[sp]
+                d = np.linalg.norm(p_ep - p_sp)
+                if d <= max_reconnect_dist_um and d < best_d:
+                    best_d = d
+                    best_sp = sp
+            if best_sp is not None:
+                new_reconnect_edges.append((ep, best_sp, 0.85, float(best_d)))
+                claimed_starts.add(best_sp)
+
+    return edges + new_reconnect_edges
+
+
+def prune_isolated_degree_0_nodes(
+    coords: np.ndarray,
+    edges: list[tuple[int, int, float, float]],
+) -> tuple[np.ndarray, list[tuple[int, int, float, float]]]:
+    """
+    Prune isolated degree-0 nodes without any connections to avoid census penalties.
+    """
+    if not edges:
+        return coords, edges
+
+    nodes_with_edges = set(e[0] for e in edges) | set(e[1] for e in edges)
+    active_node_ids = sorted(list(nodes_with_edges))
+    old_to_new = {old: new for new, old in enumerate(active_node_ids)}
+
+    clean_coords = coords[active_node_ids]
+    clean_edges = [(old_to_new[e[0]], old_to_new[e[1]], e[2], e[3]) for e in edges]
+    return clean_coords, clean_edges
 
 
 @torch.no_grad()
@@ -427,11 +564,7 @@ def track_volume(
                     dist_m_d1 = float(np.linalg.norm(p_src_um - d1_um))
                     symmetry_ratio = abs(dist_m_d1 - dist_um) / (dist_m_d1 + dist_um + 1e-6)
 
-                    # Physical laws of cytokinesis spindle (calibrated to anisotropic light-sheet):
-                    # 1. Opposing spindle poles (cos_spindle <= -0.15)
-                    # 2. Mother near spindle equator (midpoint_offset <= 4.50 um)
-                    # 3. Sister distance <= 15.34 um
-                    # 4. Branch symmetry <= 0.85
+                    # Physical laws of cytokinesis spindle:
                     v_d1 = d1_um - p_src_um
                     v_d2 = p_tgt_um - p_src_um
                     cos_spindle = float(np.dot(v_d1, v_d2) / (dist_m_d1 * dist_um + 1e-6))
@@ -456,18 +589,27 @@ def track_volume(
     coords_orig = coords_down.copy()
     coords_orig[:, 1:] *= ds_arr
 
-    # Apply Astra's Internal Gap-Protected Short-Track Pruning
+    # Step 1: Astra Internal Gap-Protected Short-Track Pruning
     if min_track_length > 1:
-        coords_clean, edges_clean = filter_short_tracks_with_gaps(
+        coords_step1, edges_step1 = filter_short_tracks_with_gaps(
             coords_orig, all_edges, min_length=min_track_length, scale=scale, total_frames=T
         )
     else:
-        coords_clean, edges_clean = coords_orig, all_edges
+        coords_step1, edges_step1 = coords_orig, all_edges
+
+    # Step 2: Cytokinesis False Division Pruning
+    edges_step2 = prune_false_divisions(coords_step1, edges_step1, scale=scale)
+
+    # Step 3: Consecutive Endpoint Reconnection (t -> t+1)
+    edges_step3 = reconnect_broken_consecutive_endpoints(coords_step1, edges_step2, scale=scale)
+
+    # Step 4: Degree-0 Isolated Node Pruning
+    coords_final, edges_final = prune_isolated_degree_0_nodes(coords_step1, edges_step3)
 
     latency_sec = time.perf_counter() - t0
     peak_vram_mb = torch.cuda.max_memory_allocated(primary_device) / (1024 ** 2) if torch.cuda.is_available() else 0.0
 
-    pred_graph = build_tracksdata_graph(coords_clean, edges_clean)
+    pred_graph = build_tracksdata_graph(coords_final, edges_final)
     return pred_graph, latency_sec, peak_vram_mb
 
 
@@ -482,7 +624,7 @@ def main():
     parser.add_argument("--volumes", nargs="+", default=["6bba_05db0fb1"], help="List of volume names to benchmark")
     parser.add_argument("--det-thresh", type=float, default=0.50, help="Detection threshold")
     parser.add_argument("--edge-thresh", type=float, default=0.48, help="Edge threshold")
-    parser.add_argument("--min-length", type=int, default=4, help="Minimum track length filter with internal gap protection")
+    parser.add_argument("--min-length", type=int, default=5, help="Minimum track length filter with internal gap protection")
     parser.add_argument("--det-tta", action="store_true", default=True, help="Use flip-xy TTA for detection")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit frames for fast test")
     args = parser.parse_args()
