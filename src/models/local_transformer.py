@@ -167,16 +167,19 @@ class SparseLocalTrackTransformer(nn.Module):
         for layer in self.rev_layers:
             h_src = layer(h_src, h_tgt, mask=cand_mask_fwd)
 
-        # 4. Pairwise edge scoring over candidate pairs
-        # Prepare pair features: [h_u (N, 1, D), h_v (1, M, D), delta (N, M, 3), dist (N, M, 1)]
-        h_src_exp = h_src.unsqueeze(1).expand(N, M, -1)
-        h_tgt_exp = h_tgt.unsqueeze(0).expand(N, M, -1)
-        delta_norm = diff / 10.0
-        dist_norm = dist_um.unsqueeze(-1) / 10.0
+        # 4. Sparse pairwise edge scoring only on candidate pairs
+        logits = torch.full((N, M), -1e4, device=feat_src.device, dtype=torch.float32)
+        cand_indices = torch.nonzero(cand_mask_fwd, as_tuple=True)
+        si, tj = cand_indices
 
-        pair_feats = torch.cat([h_src_exp, h_tgt_exp, delta_norm, dist_norm], dim=-1)
-        logits = self.pair_mlp(pair_feats).squeeze(-1) # (N, M)
+        if len(si) > 0:
+            h_s_active = h_src[si]
+            h_t_active = h_tgt[tj]
+            diff_active = diff[si, tj] / 10.0
+            dist_active = dist_um[si, tj].unsqueeze(-1) / 10.0
 
-        # Mask out pairs beyond physical reach
-        logits = logits.masked_fill(~cand_mask_fwd, -1e4)
+            active_pair_feats = torch.cat([h_s_active, h_t_active, diff_active, dist_active], dim=-1)
+            active_logits = self.pair_mlp(active_pair_feats).squeeze(-1)
+            logits[si, tj] = active_logits
+
         return logits, cand_mask_fwd
