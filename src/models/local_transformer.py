@@ -81,7 +81,7 @@ class LocalCrossAttentionBlock(nn.Module):
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale # (H, M, N)
         if mask is not None:
             # mask shape: (M, N) -> unsqueeze to (1, M, N)
-            scores = scores.masked_fill(~mask.unsqueeze(0), -1e9)
+            scores = scores.masked_fill(~mask.unsqueeze(0), -1e4)
 
         attn = F.softmax(scores, dim=-1)
         out = torch.matmul(attn, v).transpose(0, 1).contiguous().view(M, D) # (M, D)
