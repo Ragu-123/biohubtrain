@@ -118,7 +118,7 @@ if HAS_TRITON:
 
 
     @triton.jit
-    def _subvoxel_parabolic_kernel(
+    def _hessian_subvoxel_kernel(
         prob_ptr,       # [Z, Y, X] float32 detection heatmap
         peaks_ptr,      # [N, 3] int32 integer peak coordinates (z, y, x)
         out_sub_ptr,    # [N, 3] float32 continuous refined coordinates (z + dz, y + dy, x + dx)
@@ -130,9 +130,17 @@ if HAS_TRITON:
         stride_on, stride_oc,
     ):
         """
-        Analytical 2nd-order continuous parabolic Taylor expansion around peaks:
-        delta_k = (P_{k-1} - P_{k+1}) / (2 * (P_{k-1} - 2*P_0 + P_{k+1}))
-        Clamped to [-0.5, 0.5] for mathematical stability.
+        Full 3D Regularized Hessian Sub-Voxel Continuous Refinement via Triton Registers:
+        1. Evaluates 1st order central gradient g = 0.5 * (f(x+1) - f(x-1)).
+        2. Evaluates full 3D symmetric Hessian H with cross terms H_zy, H_zx, H_yx.
+        3. Computes branch-free Gershgorin spectral upper bound:
+             rho = max_i (H_ii + sum_{j != i} |H_ij|)
+           and enforces strict positive-definiteness on A = lambda*I - H via Levenberg-Marquardt:
+             lambda = max(0.0, rho + 2.0 * ||g||_2 + 0.05)
+        4. Solves delta = A^{-1} * g analytically via closed-form 3x3 adjugate matrix in registers:
+             delta = adj(A) * g / det(A)
+           with zero matrix iteration or thread divergence.
+        5. Clamps displacement to unit voxel box [-0.5, 0.5]^3.
         """
         pid = tl.program_id(0)
 
@@ -140,35 +148,97 @@ if HAS_TRITON:
         y0 = tl.load(peaks_ptr + pid * stride_kn + 1 * stride_kc)
         x0 = tl.load(peaks_ptr + pid * stride_kn + 2 * stride_kc)
 
+        # Boundary check
+        if z0 < 1 or z0 >= Z - 1 or y0 < 1 or y0 >= Y - 1 or x0 < 1 or x0 >= X - 1:
+            tl.store(out_sub_ptr + pid * stride_on + 0 * stride_oc, z0.to(tl.float32))
+            tl.store(out_sub_ptr + pid * stride_on + 1 * stride_oc, y0.to(tl.float32))
+            tl.store(out_sub_ptr + pid * stride_on + 2 * stride_oc, x0.to(tl.float32))
+            return
+
         # Central peak value
-        p0 = tl.load(prob_ptr + z0 * stride_pz + y0 * stride_py + x0 * stride_px)
+        p000 = tl.load(prob_ptr + z0 * stride_pz + y0 * stride_py + x0 * stride_px)
 
-        # 1. Z-axis curvature
-        zm1 = tl.maximum(0, z0 - 1)
-        zp1 = tl.minimum(Z - 1, z0 + 1)
-        p_zm1 = tl.load(prob_ptr + zm1 * stride_pz + y0 * stride_py + x0 * stride_px)
-        p_zp1 = tl.load(prob_ptr + zp1 * stride_pz + y0 * stride_py + x0 * stride_px)
-        denom_z = 2.0 * (p_zm1 - 2.0 * p0 + p_zp1)
-        dz = tl.where(tl.abs(denom_z) > 1e-5, (p_zm1 - p_zp1) / denom_z, 0.0)
-        dz_clamped = tl.maximum(-0.5, tl.minimum(0.5, dz))
+        # 6 Axis-aligned neighbor voxels
+        p_p00 = tl.load(prob_ptr + (z0 + 1) * stride_pz + y0 * stride_py + x0 * stride_px)
+        p_m00 = tl.load(prob_ptr + (z0 - 1) * stride_pz + y0 * stride_py + x0 * stride_px)
+        p_0p0 = tl.load(prob_ptr + z0 * stride_pz + (y0 + 1) * stride_py + x0 * stride_px)
+        p_0m0 = tl.load(prob_ptr + z0 * stride_pz + (y0 - 1) * stride_py + x0 * stride_px)
+        p_00p = tl.load(prob_ptr + z0 * stride_pz + y0 * stride_py + (x0 + 1) * stride_px)
+        p_00m = tl.load(prob_ptr + z0 * stride_pz + y0 * stride_py + (x0 - 1) * stride_px)
 
-        # 2. Y-axis curvature
-        ym1 = tl.maximum(0, y0 - 1)
-        yp1 = tl.minimum(Y - 1, y0 + 1)
-        p_ym1 = tl.load(prob_ptr + z0 * stride_pz + ym1 * stride_py + x0 * stride_px)
-        p_yp1 = tl.load(prob_ptr + z0 * stride_pz + yp1 * stride_py + x0 * stride_px)
-        denom_y = 2.0 * (p_ym1 - 2.0 * p0 + p_yp1)
-        dy = tl.where(tl.abs(denom_y) > 1e-5, (p_ym1 - p_yp1) / denom_y, 0.0)
-        dy_clamped = tl.maximum(-0.5, tl.minimum(0.5, dy))
+        # 12 Cross planar neighbors
+        p_pp0 = tl.load(prob_ptr + (z0 + 1) * stride_pz + (y0 + 1) * stride_py + x0 * stride_px)
+        p_pm0 = tl.load(prob_ptr + (z0 + 1) * stride_pz + (y0 - 1) * stride_py + x0 * stride_px)
+        p_mp0 = tl.load(prob_ptr + (z0 - 1) * stride_pz + (y0 + 1) * stride_py + x0 * stride_px)
+        p_mm0 = tl.load(prob_ptr + (z0 - 1) * stride_pz + (y0 - 1) * stride_py + x0 * stride_px)
 
-        # 3. X-axis curvature
-        xm1 = tl.maximum(0, x0 - 1)
-        xp1 = tl.minimum(X - 1, x0 + 1)
-        p_xm1 = tl.load(prob_ptr + z0 * stride_pz + y0 * stride_py + xm1 * stride_px)
-        p_xp1 = tl.load(prob_ptr + z0 * stride_pz + y0 * stride_py + xp1 * stride_px)
-        denom_x = 2.0 * (p_xm1 - 2.0 * p0 + p_xp1)
-        dx = tl.where(tl.abs(denom_x) > 1e-5, (p_xm1 - p_xp1) / denom_x, 0.0)
-        dx_clamped = tl.maximum(-0.5, tl.minimum(0.5, dx))
+        p_p0p = tl.load(prob_ptr + (z0 + 1) * stride_pz + y0 * stride_py + (x0 + 1) * stride_px)
+        p_p0m = tl.load(prob_ptr + (z0 + 1) * stride_pz + y0 * stride_py + (x0 - 1) * stride_px)
+        p_m0p = tl.load(prob_ptr + (z0 - 1) * stride_pz + y0 * stride_py + (x0 + 1) * stride_px)
+        p_m0m = tl.load(prob_ptr + (z0 - 1) * stride_pz + y0 * stride_py + (x0 - 1) * stride_px)
+
+        p_0pp = tl.load(prob_ptr + z0 * stride_pz + (y0 + 1) * stride_py + (x0 + 1) * stride_px)
+        p_0pm = tl.load(prob_ptr + z0 * stride_pz + (y0 + 1) * stride_py + (x0 - 1) * stride_px)
+        p_0mp = tl.load(prob_ptr + z0 * stride_pz + (y0 - 1) * stride_py + (x0 + 1) * stride_px)
+        p_0mm = tl.load(prob_ptr + z0 * stride_pz + (y0 - 1) * stride_py + (x0 - 1) * stride_px)
+
+        # 1. First-order central gradient
+        gz = 0.5 * (p_p00 - p_m00)
+        gy = 0.5 * (p_0p0 - p_0m0)
+        gx = 0.5 * (p_00p - p_00m)
+
+        # 2. Second-order Hessian elements
+        Hzz = p_p00 - 2.0 * p000 + p_m00
+        Hyy = p_0p0 - 2.0 * p000 + p_0m0
+        Hxx = p_00p - 2.0 * p000 + p_00m
+
+        Hzy = 0.25 * (p_pp0 - p_pm0 - p_mp0 + p_mm0)
+        Hzx = 0.25 * (p_p0p - p_p0m - p_m0p + p_m0m)
+        Hyx = 0.25 * (p_0pp - p_0pm - p_0mp + p_0mm)
+
+        # 3. Gershgorin spectral upper bound
+        rho_z = Hzz + tl.abs(Hzy) + tl.abs(Hzx)
+        rho_y = Hyy + tl.abs(Hzy) + tl.abs(Hyx)
+        rho_x = Hxx + tl.abs(Hzx) + tl.abs(Hyx)
+        rho = tl.maximum(rho_z, tl.maximum(rho_y, rho_x))
+
+        norm_g = tl.sqrt(gz * gz + gy * gy + gx * gx + 1e-12)
+        lam = tl.maximum(0.0, rho + 2.0 * norm_g + 0.05)
+
+        # Matrix A = lambda*I - H
+        a = lam - Hzz
+        b = -Hzy
+        c = -Hzx
+        d = lam - Hyy
+        e = -Hyx
+        f = lam - Hxx
+
+        # Determinant of symmetric 3x3 matrix A
+        detA = a * (d * f - e * e) - b * (b * f - e * c) + c * (b * e - d * c)
+
+        if detA > 1e-6:
+            adj00 = d * f - e * e
+            adj01 = c * e - b * f
+            adj02 = b * e - c * d
+            adj10 = c * e - b * f
+            adj11 = a * f - c * c
+            adj12 = b * c - a * e
+            adj20 = b * e - c * d
+            adj21 = b * c - a * e
+            adj22 = a * d - b * b
+
+            inv_det = 1.0 / detA
+            dz = inv_det * (adj00 * gz + adj01 * gy + adj02 * gx)
+            dy = inv_det * (adj10 * gz + adj11 * gy + adj12 * gx)
+            dx = inv_det * (adj20 * gz + adj21 * gy + adj22 * gx)
+
+            dz_clamped = tl.maximum(-0.5, tl.minimum(0.5, dz))
+            dy_clamped = tl.maximum(-0.5, tl.minimum(0.5, dy))
+            dx_clamped = tl.maximum(-0.5, tl.minimum(0.5, dx))
+        else:
+            dz_clamped = 0.0
+            dy_clamped = 0.0
+            dx_clamped = 0.0
 
         # Store continuous refined coordinates
         tl.store(out_sub_ptr + pid * stride_on + 0 * stride_oc, z0.to(tl.float32) + dz_clamped)
@@ -220,7 +290,7 @@ def trilinear_index_triton(feat_map: torch.Tensor, coords: torch.Tensor) -> torc
 
 def refine_subvoxel_peaks_triton(prob_map: torch.Tensor, int_peaks: torch.Tensor) -> torch.Tensor:
     """
-    Python wrapper for _subvoxel_parabolic_kernel.
+    Python wrapper for _hessian_subvoxel_kernel.
     prob_map:  (Z, Y, X) float32 on CUDA
     int_peaks: (N, 3) int32 on CUDA in order (z, y, x)
     Returns:   (N, 3) float32 continuous coordinates.
@@ -230,15 +300,87 @@ def refine_subvoxel_peaks_triton(prob_map: torch.Tensor, int_peaks: torch.Tensor
         return torch.empty((0, 3), device=prob_map.device, dtype=torch.float32)
 
     if not HAS_TRITON or not prob_map.is_cuda:
-        # CPU Fallback
-        coords_cont = int_peaks.to(torch.float32).clone()
+        # Vectorized PyTorch fallback for CPU or non-Triton environments
+        Z, Y, X = prob_map.shape
+        z0 = int_peaks[:, 0].clamp(1, Z - 2).long()
+        y0 = int_peaks[:, 1].clamp(1, Y - 2).long()
+        x0 = int_peaks[:, 2].clamp(1, X - 2).long()
+
+        p000 = prob_map[z0, y0, x0]
+        p_p00 = prob_map[z0 + 1, y0, x0]
+        p_m00 = prob_map[z0 - 1, y0, x0]
+        p_0p0 = prob_map[z0, y0 + 1, x0]
+        p_0m0 = prob_map[z0, y0 - 1, x0]
+        p_00p = prob_map[z0, y0, x0 + 1]
+        p_00m = prob_map[z0, y0, x0 - 1]
+
+        p_pp0 = prob_map[z0 + 1, y0 + 1, x0]
+        p_pm0 = prob_map[z0 + 1, y0 - 1, x0]
+        p_mp0 = prob_map[z0 - 1, y0 + 1, x0]
+        p_mm0 = prob_map[z0 - 1, y0 - 1, x0]
+
+        p_p0p = prob_map[z0 + 1, y0, x0 + 1]
+        p_p0m = prob_map[z0 + 1, y0, x0 - 1]
+        p_m0p = prob_map[z0 - 1, y0, x0 + 1]
+        p_m0m = prob_map[z0 - 1, y0, x0 - 1]
+
+        p_0pp = prob_map[z0, y0 + 1, x0 + 1]
+        p_0pm = prob_map[z0, y0 + 1, x0 - 1]
+        p_0mp = prob_map[z0, y0 - 1, x0 + 1]
+        p_0mm = prob_map[z0, y0 - 1, x0 - 1]
+
+        gz = 0.5 * (p_p00 - p_m00)
+        gy = 0.5 * (p_0p0 - p_0m0)
+        gx = 0.5 * (p_00p - p_00m)
+
+        Hzz = p_p00 - 2.0 * p000 + p_m00
+        Hyy = p_0p0 - 2.0 * p000 + p_0m0
+        Hxx = p_00p - 2.0 * p000 + p_00m
+
+        Hzy = 0.25 * (p_pp0 - p_pm0 - p_mp0 + p_mm0)
+        Hzx = 0.25 * (p_p0p - p_p0m - p_m0p + p_m0m)
+        Hyx = 0.25 * (p_0pp - p_0pm - p_0mp + p_0mm)
+
+        rho = torch.maximum(
+            Hzz + Hzy.abs() + Hzx.abs(),
+            torch.maximum(Hyy + Hzy.abs() + Hyx.abs(), Hxx + Hzx.abs() + Hyx.abs())
+        )
+        norm_g = torch.sqrt(gz * gz + gy * gy + gx * gx + 1e-12)
+        lam = torch.clamp(rho + 2.0 * norm_g + 0.05, min=0.0)
+
+        a, b, c = lam - Hzz, -Hzy, -Hzx
+        d, e = lam - Hyy, -Hyx
+        f = lam - Hxx
+
+        detA = a * (d * f - e * e) - b * (b * f - e * c) + c * (b * e - d * c)
+        safe_mask = detA > 1e-6
+
+        inv_det = torch.where(safe_mask, 1.0 / detA.clamp(min=1e-6), torch.zeros_like(detA))
+        adj00 = d * f - e * e
+        adj01 = c * e - b * f
+        adj02 = b * e - c * d
+        adj10 = c * e - b * f
+        adj11 = a * f - c * c
+        adj12 = b * c - a * e
+        adj20 = b * e - c * d
+        adj21 = b * c - a * e
+        adj22 = a * d - b * b
+
+        dz = (inv_det * (adj00 * gz + adj01 * gy + adj02 * gx)).clamp(-0.5, 0.5)
+        dy = (inv_det * (adj10 * gz + adj11 * gy + adj12 * gx)).clamp(-0.5, 0.5)
+        dx = (inv_det * (adj20 * gz + adj21 * gy + adj22 * gx)).clamp(-0.5, 0.5)
+
+        coords_cont = int_peaks.float().clone()
+        coords_cont[:, 0] += dz
+        coords_cont[:, 1] += dy
+        coords_cont[:, 2] += dx
         return coords_cont
 
     Z, Y, X = prob_map.shape
     out_sub = torch.empty((N, 3), device=prob_map.device, dtype=torch.float32)
     grid = (N,)
 
-    _subvoxel_parabolic_kernel[grid](
+    _hessian_subvoxel_kernel[grid](
         prob_map, int_peaks, out_sub,
         Z, Y, X,
         prob_map.stride(0), prob_map.stride(1), prob_map.stride(2),

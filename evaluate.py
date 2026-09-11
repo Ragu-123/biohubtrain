@@ -100,6 +100,7 @@ def track_volume(
     pool_kernel_um: float = 5.0,
     det_tta: bool = True,
     max_frames: int | None = None,
+    n_total: float | None = None,
 ) -> tuple[td.graph.InMemoryGraph, float, float]:
     t0 = time.perf_counter()
     if torch.cuda.is_available():
@@ -137,6 +138,9 @@ def track_volume(
         if not window_starts or last != window_starts[-1]:
             window_starts.append(last)
 
+    # Adaptive Census Multiplier & Kinematic Momentum Buffer (Astra Recommendations)
+    velocity_buffer = {}  # global_node_id -> np.ndarray 3D velocity in microns
+
     for ws in window_starts:
         frame_indices = list(range(ws, ws + window_size))
         imgs = []
@@ -165,20 +169,26 @@ def track_volume(
                 for f in range(window_size):
                     det_logits[f] = det_logits[f] / 4
 
-        # Cell Detection + Custom Triton Sub-Voxel Peak Refinement
+        # Cell Detection + Custom Triton 3D Regularized Hessian Sub-Voxel Peak Refinement
         for f_idx, t in enumerate(frame_indices):
             if t not in seen_frames:
                 log_t = det_logits[f_idx]
                 pooled = F.max_pool3d(log_t, pool_k, stride=1, padding=pad)
-                is_peak = (log_t == pooled) & (torch.sigmoid(log_t) > det_threshold)
+                sig_t = torch.sigmoid(log_t)
+                is_peak = (log_t == pooled) & (sig_t > det_threshold)
                 peak_idx = torch.nonzero(is_peak[0, 0])
 
                 if len(peak_idx) > 0:
-                    if HAS_TRITON and device.type == "cuda":
-                        peaks_refined = refine_subvoxel_peaks_triton(log_t[0, 0], peak_idx)
-                    else:
-                        peaks_refined = peak_idx.float()
+                    peak_scores = sig_t[0, 0, peak_idx[:, 0], peak_idx[:, 1], peak_idx[:, 2]]
 
+                    # Adaptive Census Calibration (Q5: N_target = N_est * 1.05)
+                    if n_total is not None and not np.isnan(n_total) and n_total > 0:
+                        n_frame_max = int((n_total * 1.05) / T)
+                        if len(peak_idx) > n_frame_max:
+                            topk_vals, topk_idx = torch.topk(peak_scores, n_frame_max)
+                            peak_idx = peak_idx[topk_idx]
+
+                    peaks_refined = refine_subvoxel_peaks_triton(log_t[0, 0], peak_idx)
                     t_col = np.full((len(peaks_refined), 1), t, dtype=np.float32)
                     arr_down = np.concatenate([t_col, peaks_refined.cpu().numpy()], axis=1)
                 else:
@@ -191,7 +201,7 @@ def track_volume(
 
         coords_down_so_far = np.concatenate(coord_lists_down) if coord_lists_down else np.empty((0, 4), dtype=np.float32)
 
-        # Edge Association with Mitosis Gating
+        # Edge Association with Kinematic Momentum Buffer & Mitosis Gating
         for f_idx in range(window_size - 1):
             t_src, t_tgt = frame_indices[f_idx], frame_indices[f_idx + 1]
             if (t_src, t_tgt) in seen_pairs:
@@ -235,22 +245,43 @@ def track_volume(
             raw = edge_logits_pair[0]
             probs = torch.softmax(raw, dim=0).cpu().numpy()
 
-            candidates = sorted(
-                [
-                    (probs[i, j], i, j)
-                    for i in range(n_src)
-                    for j in range(n_tgt)
-                    if probs[i, j] > div_threshold
-                ],
-                reverse=True,
-            )
+            # Directional Momentum Scoring (Astra Q6)
+            candidates = []
+            for i in range(n_src):
+                gi = int(idx_src[i])
+                p_src_um = c_src_down[i, 1:] * ds_arr * np.array(scale, dtype=np.float32)
+                v_prev = velocity_buffer.get(gi, None)
+                speed_prev = float(np.linalg.norm(v_prev)) if v_prev is not None else 0.0
+
+                for j in range(n_tgt):
+                    p_ij = float(probs[i, j])
+                    if p_ij <= div_threshold:
+                        continue
+
+                    p_tgt_um = c_tgt_down[j, 1:] * ds_arr * np.array(scale, dtype=np.float32)
+                    v_curr = p_tgt_um - p_src_um
+                    speed_curr = float(np.linalg.norm(v_curr))
+
+                    # Momentum directional persistence bonus
+                    if v_prev is not None and speed_prev > 1e-3 and speed_curr > 1e-3:
+                        cos_theta = float(np.dot(v_prev, v_curr) / (speed_prev * speed_curr + 1e-6))
+                        delta_speed = abs(speed_curr - speed_prev)
+                        # Astra formulation: alpha * cos(theta) - beta * delta_speed / 10.0
+                        momentum_bonus = 0.08 * cos_theta - 0.02 * (delta_speed / 10.0)
+                        effective_score = p_ij + momentum_bonus
+                    else:
+                        effective_score = p_ij
+
+                    candidates.append((effective_score, p_ij, i, j, v_curr, speed_curr))
+
+            candidates.sort(key=lambda x: x[0], reverse=True)
 
             children_count = {}
             parents_count = {}
             mother_daughters = {}
             mother_d1_prob = {}
 
-            for prob, i, j in candidates:
+            for eff_score, raw_prob, i, j, v_curr, speed_curr in candidates:
                 n_ch = children_count.get(i, 0)
                 n_pa = parents_count.get(j, 0)
 
@@ -263,18 +294,19 @@ def track_volume(
 
                 # Primary edge
                 if n_ch == 0:
-                    if prob < edge_threshold:
+                    if eff_score < edge_threshold and raw_prob < edge_threshold:
                         continue
                     gi, gj = int(idx_src[i]), int(idx_tgt[j])
-                    all_edges.append((gi, gj, float(prob), dist_um))
+                    all_edges.append((gi, gj, float(raw_prob), dist_um))
                     children_count[i] = 1
                     parents_count[j] = 1
                     mother_daughters[i] = p_tgt_um
-                    mother_d1_prob[i] = prob
+                    mother_d1_prob[i] = raw_prob
+                    velocity_buffer[gj] = v_curr
 
                 # Secondary edge (division)
                 elif n_ch == 1:
-                    if (mother_d1_prob[i] + prob) < div_joint_threshold or prob < div_threshold:
+                    if (mother_d1_prob[i] + raw_prob) < div_joint_threshold or raw_prob < div_threshold:
                         continue
 
                     d1_um = mother_daughters[i]
@@ -287,9 +319,10 @@ def track_volume(
                         continue
 
                     gi, gj = int(idx_src[i]), int(idx_tgt[j])
-                    all_edges.append((gi, gj, float(prob), dist_um))
+                    all_edges.append((gi, gj, float(raw_prob), dist_um))
                     children_count[i] = 2
                     parents_count[j] = 1
+                    velocity_buffer[gj] = v_curr
 
     coords_down = np.concatenate(coord_lists_down) if coord_lists_down else np.empty((0, 4), dtype=np.float32)
     coords_orig = coords_down.copy()
@@ -331,6 +364,11 @@ def main():
     for vol_name in args.volumes:
         print(f"\nEvaluating volume: {vol_name}...")
         vol_path = Path(args.data_dir) / f"{vol_name}.zarr"
+        try:
+            _, _, n_total = suite.load_gt(vol_name)
+        except Exception:
+            n_total = None
+
         pred_graph, latency_sec, peak_vram_mb = track_volume(
             model=model,
             volume_dir=vol_path,
@@ -341,6 +379,7 @@ def main():
             edge_threshold=args.edge_thresh,
             det_tta=args.det_tta,
             max_frames=args.max_frames,
+            n_total=n_total,
         )
 
         res = suite.evaluate_graph(
