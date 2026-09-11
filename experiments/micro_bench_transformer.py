@@ -56,7 +56,8 @@ def run_transformer_benchmark(device: str = "cuda:0" if torch.cuda.is_available(
         feat_src = torch.randn(N, 32, device=dev)
         coords_src = torch.rand(N, 3, device=dev) * 100.0 # 100 um volume
         feat_tgt = torch.randn(M, 32, device=dev)
-        coords_tgt = coords_src[:M].clone() + torch.randn(M, 3, device=dev) * 3.0 # ~3 um motion
+        coords_base = torch.cat([coords_src, coords_src[:M - N]], dim=0) if M > N else coords_src[:M]
+        coords_tgt = coords_base + torch.randn(M, 3, device=dev) * 3.0 # ~3 um motion
 
         diff_pos = (coords_src.unsqueeze(1) - coords_tgt.unsqueeze(0)) / 10.0
 
