@@ -120,8 +120,8 @@ def main():
 
     # 3. Loss & Optimizer
     loss_fn = AnisoTrackingLoss(
-        det_loss_weight=1.0,
-        det_neg_weight=0.01,
+        det_loss_weight=10.0,
+        det_neg_weight=0.1,
         subvoxel_loss_weight=0.5,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)

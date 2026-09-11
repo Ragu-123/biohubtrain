@@ -108,6 +108,12 @@ class SubVoxelPeakRefiner(nn.Module):
         # Predicts both peak logit and sub-voxel residual delta (dz, dy, dx)
         self.det_head = nn.Conv3d(in_channels, 1, kernel_size=1)
         self.delta_head = nn.Conv3d(in_channels, 3, kernel_size=1)
+        # Prior probability initialization: set bias to -4.0 (sigma(-4.0) = 0.018)
+        # to ensure background suppression from step 0
+        nn.init.constant_(self.det_head.bias, -4.0)
+        nn.init.normal_(self.det_head.weight, std=0.01)
+        nn.init.constant_(self.delta_head.bias, 0.0)
+        nn.init.normal_(self.delta_head.weight, std=0.001)
 
     def forward(self, feat: torch.Tensor):
         logits = self.det_head(feat)
