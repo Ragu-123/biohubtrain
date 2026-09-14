@@ -32,13 +32,17 @@ try:
 except Exception:
     pass
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+repo_root = str(Path(__file__).resolve().parent)
+if repo_root in sys.path:
+    sys.path.remove(repo_root)
+sys.path.insert(0, repo_root)
+
 for p in [
     "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/src",
     "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/scripts",
 ]:
     if p not in sys.path and Path(p).exists():
-        sys.path.insert(0, p)
+        sys.path.append(p)
 
 from src.models import AnisoTrack3D, trilinear_index_features
 from src.training.losses import AnisoTrackingLoss
@@ -67,7 +71,12 @@ def custom_collate(batch):
 
 def evaluate_checkpoint(model, data_dir: Path, val_volumes: list[str], downsample: tuple, device: torch.device):
     """Evaluates the model on validation volumes using the official metric engine."""
-    from evaluate import track_volume
+    import importlib.util
+    eval_path = Path(__file__).resolve().parent / "evaluate.py"
+    spec = importlib.util.spec_from_file_location("local_evaluate", str(eval_path))
+    local_eval = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(local_eval)
+    track_volume = local_eval.track_volume
 
     suite = BenchmarkSuite(train_dir=data_dir, max_matching_distance_um=7.0)
     scores = []

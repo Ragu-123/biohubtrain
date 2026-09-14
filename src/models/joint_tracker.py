@@ -93,6 +93,11 @@ class AnisoTrack3D(nn.Module):
         """
         return self.unet(imgs, return_flows=return_flows)
 
+    def _index_features(self, feat_map: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        if coords.dim() == 3:
+            coords = coords.squeeze(0)
+        return trilinear_index_features(feat_map, coords).unsqueeze(0)
+
     def sample_features(self, feat_map: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
         return trilinear_index_features(feat_map, coords)
 
@@ -100,18 +105,26 @@ class AnisoTrack3D(nn.Module):
         """Samples continuous 3D velocity vectors (v_z, v_y, v_x) at cell coordinates."""
         return trilinear_index_features(flow_map, coords)
 
-    def predict_edges(
-        self,
-        feat_src: torch.Tensor,
-        coords_src_um: torch.Tensor,
-        feat_tgt: torch.Tensor,
-        coords_tgt_um: torch.Tensor,
-        flow_src_um: torch.Tensor = None,
-    ):
+    def predict_edges(self, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, d: torch.Tensor, *args, **kwargs):
         """
-        Computes pairwise transition logits between source and target cells.
+        Universal predictor handling both evaluate.py and train.py signatures.
         """
-        return self.transformer(feat_src, coords_src_um, feat_tgt, coords_tgt_um, flow_src_um=flow_src_um)
+        if b.shape[-1] != 3 and c.shape[-1] == 3:
+            # evaluate.py: (feat_src, feat_tgt, coords_src_um, coords_tgt_um)
+            f_s = a.squeeze(0) if a.dim() == 3 else a
+            f_t = b.squeeze(0) if b.dim() == 3 else b
+            c_s = c.squeeze(0) if c.dim() == 3 else c
+            c_t = d.squeeze(0) if d.dim() == 3 else d
+            logits, cand_mask = self.transformer(f_s, c_s, f_t, c_t)
+            return logits.unsqueeze(0), cand_mask.unsqueeze(0)
+        else:
+            # train.py: (feat_src, coords_src_um, feat_tgt, coords_tgt_um)
+            f_s = a.squeeze(0) if a.dim() == 3 else a
+            c_s = b.squeeze(0) if b.dim() == 3 else b
+            f_t = c.squeeze(0) if c.dim() == 3 else c
+            c_t = d.squeeze(0) if d.dim() == 3 else d
+            flow_src_um = kwargs.get("flow_src_um", None)
+            return self.transformer(f_s, c_s, f_t, c_t, flow_src_um=flow_src_um)
 
     def decode_edges(
         self,
