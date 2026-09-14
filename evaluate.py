@@ -23,6 +23,8 @@ import time
 from pathlib import Path
 from typing import Sequence
 
+from tqdm import tqdm
+
 import numpy as np
 import polars as pl
 
@@ -420,7 +422,8 @@ def track_volume(
     # Directional Kinematic Momentum Buffer (Astra Q6)
     velocity_buffer: dict[int, np.ndarray] = {}
 
-    for ws in window_starts:
+    pbar = tqdm(window_starts, desc=f"Volume {volume_dir.name[:16]}", file=sys.stdout, ncols=90, mininterval=1.0)
+    for ws in pbar:
         frame_indices = list(range(ws, ws + window_size))
         imgs_raw = []
         for t in frame_indices:
@@ -694,6 +697,8 @@ def track_volume(
                             children_count[i] = 2
                             parents_count[j] = 1
                             velocity_buffer[gj] = p_t - p_s
+
+        pbar.set_postfix({"nodes": global_node_count, "edges": len(all_edges)})
 
     coords_down = np.concatenate(coord_lists_down) if coord_lists_down else np.empty((0, 4), dtype=np.float32)
     coords_orig = coords_down.copy()

@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import polars as pl
 if not hasattr(pl, "Float16"):
@@ -62,6 +63,7 @@ def parse_args():
     parser.add_argument("--num-volumes", type=int, default=None, help="Number of volumes to load (default: all)")
     parser.add_argument("--val-volumes", type=str, default="44b6_3a861e03,44b6_12dfb391", help="Comma-separated validation volumes")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save weights")
+    parser.add_argument("--pretrained", type=str, default=None, help="Path to pre-trained weights (.pth)")
     return parser.parse_args()
 
 
@@ -174,6 +176,17 @@ def main():
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Bio-DANT Initialized: {param_count:,} trainable parameters.")
 
+    if args.pretrained and Path(args.pretrained).exists():
+        print(f"Loading pre-trained checkpoint from: {args.pretrained}")
+        sd = torch.load(args.pretrained, map_location=device)
+        u_sd = sd.get("unet_state_dict", sd)
+        t_sd = sd.get("transformer_state_dict", None)
+        u_miss, u_unexp = model.unet.load_state_dict(u_sd, strict=False)
+        print(f"  UNet loaded (missing={len(u_miss)}, unexpected={len(u_unexp)})")
+        if t_sd is not None:
+            t_miss, t_unexp = model.transformer.load_state_dict(t_sd, strict=False)
+            print(f"  Transformer loaded (missing={len(t_miss)}, unexpected={len(t_unexp)})")
+
     # 3. Loss & Optimizer
     loss_fn = AnisoTrackingLoss(
         det_loss_weight=10.0,
@@ -200,7 +213,8 @@ def main():
 
     for epoch in range(args.epochs):
         model.train()
-        for batch_idx, batch in enumerate(dataloader):
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", file=sys.stdout, ncols=95, mininterval=1.0)
+        for batch_idx, batch in enumerate(pbar):
             t0 = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
 
@@ -273,8 +287,15 @@ def main():
             throughput = B / max(t_step, 1e-4)
 
             global_step += 1
-            if global_step % 1 == 0:
-                print(f"{epoch+1:<6} | {global_step:<6} | {loss.item():<11.4f} | {edge_loss_sum/B:<10.4f} | {det_loss_sum/B:<9.4f} | {adv_loss_sum/B:<9.4f} | {throughput:<6.1f} p/s")
+            pbar.set_postfix({
+                "loss": f"{loss.item():.3f}",
+                "edge": f"{edge_loss_sum/B:.3f}",
+                "det": f"{det_loss_sum/B:.3f}",
+                "adv": f"{adv_loss_sum/B:.3f}",
+                "p/s": f"{throughput:.1f}"
+            })
+            if global_step % 10 == 0:
+                pbar.write(f"Epoch {epoch+1:<2} | Step {global_step:<5} | Loss: {loss.item():.4f} (Edge: {edge_loss_sum/B:.4f}, Det: {det_loss_sum/B:.4f}, Adv: {adv_loss_sum/B:.4f}) | {throughput:.1f} p/s")
 
         # Save checkpoint per epoch
         raw_model = model.unet.module if hasattr(model.unet, "module") else model.unet
