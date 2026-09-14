@@ -176,7 +176,7 @@ def prune_false_divisions(
     coords: np.ndarray,
     edges: list[tuple[int, int, float, float]],
     scale: tuple[float, ...],
-    cos_spindle_thresh: float = -0.45,
+    cos_spindle_thresh: float = -0.25,
     midpoint_thresh: float = 3.20,
     min_prob: float = 0.50,
 ) -> list[tuple[int, int, float, float]]:
@@ -628,7 +628,7 @@ def track_volume(
                             cos_sp = float(np.dot(w1, w2) / max(n1 * n2, 1e-6))
                             mid_off = float(np.linalg.norm(0.5 * (d1 + p_t) - p_comov))
                             sym_rat = abs(n1 - n2) / (n1 + n2 + 1e-6)
-                            if cos_sp > -0.45 or mid_off > 3.20 or sym_rat > 0.60:
+                            if cos_sp > -0.25 or mid_off > 3.80 or sym_rat > 0.75:
                                 continue
                             gi, gj = int(idx_src[i]), int(idx_tgt[j])
                             all_edges.append((gi, gj, float(raw_prob), float(dist_um)))
