@@ -98,11 +98,17 @@ class BenchmarkSuite:
                 from biohub_tracking.division_metrics import _match_full
                 matched_pred = _match_full(pred_graph, gt_graph, scale=scale, max_distance=self.max_matching_distance_um)
                 node_attrs = matched_pred.node_attrs(attr_keys=[td.DEFAULT_ATTR_KEYS.NODE_ID, td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID, "t", "z", "y", "x"])
+                scale_arr = np.array(scale, dtype=np.float32)
+
+                # Build fast O(1) coordinate lookup map: node_id -> np.array([z, y, x]) in um
+                coord_map = {}
+                for r in node_attrs.iter_rows(named=True):
+                    coord_map[r[td.DEFAULT_ATTR_KEYS.NODE_ID]] = np.array([r["z"], r["y"], r["x"]], dtype=np.float32) * scale_arr
+
                 matched_nodes = node_attrs.filter(
                     pl.col(td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID).is_not_null()
                     & (pl.col(td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID) != -1)
                 )
-                scale_arr = np.array(scale, dtype=np.float32)
                 for row in matched_nodes.iter_rows(named=True):
                     pred_node = row[td.DEFAULT_ATTR_KEYS.NODE_ID]
                     gt_node = row[td.DEFAULT_ATTR_KEYS.MATCHED_NODE_ID]
@@ -112,49 +118,49 @@ class BenchmarkSuite:
                         t = int(row["t"])
                         succs = pred_graph.successors(pred_node)
                         preds = pred_graph.predecessors(pred_node)
-                        p_m = np.array([row["z"], row["y"], row["x"]]) * scale_arr
-                        if preds:
-                            p_pred_row = pred_graph.node_attrs(node_ids=[preds[0]], attr_keys=["z", "y", "x"]).to_dicts()[0]
-                            p_pred = np.array([p_pred_row["z"], p_pred_row["y"], p_pred_row["x"]]) * scale_arr
+                        p_m = coord_map[pred_node]
+                        if preds and preds[0] in coord_map:
+                            p_pred = coord_map[preds[0]]
                             v_mom = p_m - p_pred
                         else:
-                            v_mom = np.zeros(3)
+                            v_mom = np.zeros(3, dtype=np.float32)
                         p_comov = p_m + v_mom
-                        c_rows = pred_graph.node_attrs(node_ids=succs[:2], attr_keys=["z", "y", "x"]).to_dicts()
-                        p_c1 = np.array([c_rows[0]["z"], c_rows[0]["y"], c_rows[0]["x"]]) * scale_arr
-                        p_c2 = np.array([c_rows[1]["z"], c_rows[1]["y"], c_rows[1]["x"]]) * scale_arr
-                        w1 = p_c1 - p_comov
-                        w2 = p_c2 - p_comov
-                        d1 = float(np.linalg.norm(w1))
-                        d2 = float(np.linalg.norm(w2))
-                        cos_sp = float(np.dot(w1, w2) / (d1 * d2 + 1e-6))
-                        mid_off = float(np.linalg.norm(0.5 * (p_c1 + p_c2) - p_comov))
-                        sym_rat = float(abs(d1 - d2) / (d1 + d2 + 1e-6))
-                        d_sis = float(np.linalg.norm(p_c1 - p_c2))
 
-                        def fwd_len(node_id):
-                            curr = node_id
-                            cnt = 0
+                        if len(succs) >= 2 and succs[0] in coord_map and succs[1] in coord_map:
+                            p_c1 = coord_map[succs[0]]
+                            p_c2 = coord_map[succs[1]]
+                            w1 = p_c1 - p_comov
+                            w2 = p_c2 - p_comov
+                            d1 = float(np.linalg.norm(w1))
+                            d2 = float(np.linalg.norm(w2))
+                            cos_sp = float(np.dot(w1, w2) / (d1 * d2 + 1e-6))
+                            mid_off = float(np.linalg.norm(0.5 * (p_c1 + p_c2) - p_comov))
+                            sym_rat = float(abs(d1 - d2) / (d1 + d2 + 1e-6))
+                            d_sis = float(np.linalg.norm(p_c1 - p_c2))
+
+                            def fwd_len(node_id):
+                                curr = node_id
+                                cnt = 0
+                                while True:
+                                    sc = pred_graph.successors(curr)
+                                    if not sc:
+                                        break
+                                    curr = sc[0]
+                                    cnt += 1
+                                return cnt
+                            d1_pers = fwd_len(succs[0])
+                            d2_pers = fwd_len(succs[1])
+
+                            curr = pred_node
+                            m_hist = 0
                             while True:
-                                sc = pred_graph.successors(curr)
-                                if not sc:
+                                pr = pred_graph.predecessors(curr)
+                                if not pr:
                                     break
-                                curr = sc[0]
-                                cnt += 1
-                            return cnt
-                        d1_pers = fwd_len(succs[0])
-                        d2_pers = fwd_len(succs[1])
+                                curr = pr[0]
+                                m_hist += 1
 
-                        curr = pred_node
-                        m_hist = 0
-                        while True:
-                            pr = pred_graph.predecessors(curr)
-                            if not pr:
-                                break
-                            curr = pr[0]
-                            m_hist += 1
-
-                        print(f"    [Diagnostic Division] [{tag}] PredNode={pred_node} GT={gt_node} at t={t}: cos_sp={cos_sp:.3f}, mid_off={mid_off:.3f}um, sis_dist={d_sis:.3f}um, sym_ratio={sym_rat:.3f}, m_hist={m_hist}, d1_pers={d1_pers}, d2_pers={d2_pers}")
+                            print(f"    [Diagnostic Division] [{tag}] PredNode={pred_node} GT={gt_node} at t={t}: cos_sp={cos_sp:.3f}, mid_off={mid_off:.3f}um, sis_dist={d_sis:.3f}um, sym_ratio={sym_rat:.3f}, m_hist={m_hist}, d1_pers={d1_pers}, d2_pers={d2_pers}")
             except Exception as e:
                 print(f"    [Diagnostic Division] Exception analyzing divisions: {e}")
 
