@@ -505,12 +505,7 @@ def track_volume(
             # Bidirectional Consensus Soft-Veto (Forward-Backward Softmax)
             probs_bwd = torch.softmax(edge_logits_ens, dim=0).cpu().numpy()
             probs_fwd = torch.softmax(edge_logits_ens, dim=1).cpu().numpy()
-            
-            # GPU Log-Domain Sinkhorn Unbalanced Optimal Transport (Audit Pillar 1)
-            cost_t = -edge_logits_ens.float()
-            uot_plan, _, _ = log_sinkhorn_uot(cost_t, eps=0.08, tau_1=1.5, tau_2=1.5, max_iter=25)
-            probs_uot = (uot_plan.cpu().numpy() * max(n_src, 1)).clip(0.0, 1.0)
-            probs = 0.50 * probs_uot + 0.40 * probs_bwd + 0.10 * probs_fwd
+            probs = 0.85 * probs_bwd + 0.15 * probs_fwd
 
             # Directional Momentum Candidate Scoring
             candidates = []
