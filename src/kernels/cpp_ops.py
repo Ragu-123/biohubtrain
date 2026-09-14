@@ -116,7 +116,7 @@ std::vector<torch::Tensor> fast_greedy_track(
 
             float sym_ratio = std::abs(norm1 - norm2) / (norm1 + norm2 + 1e-6f);
 
-            if (cos_spindle > -0.25f || midpoint_offset > 3.80f || sym_ratio > 0.75f) continue;
+            if (cos_spindle > -0.40f || midpoint_offset > 3.00f || sym_ratio > 0.50f) continue;
 
             out_src.push_back(i);
             out_tgt.push_back(j);

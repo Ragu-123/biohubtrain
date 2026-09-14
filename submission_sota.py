@@ -117,14 +117,17 @@ def prune_false_divisions(
     coords: np.ndarray,
     edges: list[tuple[int, int, float, float]],
     scale: tuple[float, ...],
-    cos_spindle_thresh: float = -0.25,
-    midpoint_thresh: float = 3.80,
-    min_prob: float = 0.50,
+    cos_spindle_thresh: float = -0.40,
+    midpoint_thresh: float = 3.00,
+    sym_ratio_thresh: float = 0.50,
+    min_prob: float = 0.25,
     min_mother_history: int = 2,
+    min_daughter_persistence: int = 2,
+    total_frames: int | None = None,
 ) -> list[tuple[int, int, float, float]]:
     """
     Prune spurious second-daughter edges from non-dividing cells that cause division FPs.
-    Enforces Galilean comoving reference frame, mother history, and daughter lineage persistence.
+    Enforces Galilean comoving reference frame, mother history, and multi-frame daughter lineage persistence.
     """
     if not edges:
         return edges
@@ -145,57 +148,73 @@ def prune_false_divisions(
         if len(succs) < 2:
             continue
         preds = rx_g.predecessors(d)
-
-        # Invariant 1: Mother must have established incoming tracklet history (>= 2 frames)
-        if len(preds) == 0:
-            probs = [edge_dict[(d, s)][0] for s in succs]
-            weaker_child = succs[int(np.argmin(probs))]
-            edges_to_remove.add((d, weaker_child))
-            continue
-
-        curr = d
-        m_hist = 0
-        while True:
-            pr = rx_g.predecessors(curr)
-            if not pr:
-                break
-            curr = pr[0]
-            m_hist += 1
-            if m_hist >= min_mother_history:
-                break
-        if m_hist < min_mother_history:
-            probs = [edge_dict[(d, s)][0] for s in succs]
-            weaker_child = succs[int(np.argmin(probs))]
-            edges_to_remove.add((d, weaker_child))
-            continue
-
         probs = [edge_dict[(d, s)][0] for s in succs]
+
+        # Invariant 1: Mother must have established incoming tracklet history (>= min_mother_history)
+        d_t = coords[d, 0]
+        if d_t >= min_mother_history:
+            if len(preds) == 0:
+                weaker_child = succs[int(np.argmin(probs))]
+                edges_to_remove.add((d, weaker_child))
+                continue
+
+            curr = d
+            m_hist = 0
+            while True:
+                pr = rx_g.predecessors(curr)
+                if not pr:
+                    break
+                curr = pr[0]
+                m_hist += 1
+                if m_hist >= min_mother_history:
+                    break
+            if m_hist < min_mother_history:
+                weaker_child = succs[int(np.argmin(probs))]
+                edges_to_remove.add((d, weaker_child))
+                continue
+
+        # Invariant 2: Candidate edge probability threshold (must satisfy minimum division edge confidence)
         if min(probs) < min_prob:
             weaker_child = succs[int(np.argmin(probs))]
             edges_to_remove.add((d, weaker_child))
             continue
 
-        # Invariant 2: Daughter Lineage Persistence (daughters must survive >= 1 frame after mitosis)
-        d1_succs = rx_g.successors(succs[0])
-        d2_succs = rx_g.successors(succs[1])
-        if len(d1_succs) == 0 and len(d2_succs) > 0:
-            # succs[0] died immediately; succs[1] survived -> prune spurious succs[0]
-            edges_to_remove.add((d, succs[0]))
-            continue
-        elif len(d2_succs) == 0 and len(d1_succs) > 0:
-            # succs[1] died immediately; succs[0] survived -> prune spurious succs[1]
-            edges_to_remove.add((d, succs[1]))
-            continue
-        elif len(d1_succs) == 0 and len(d2_succs) == 0:
-            # Both died immediately -> prune weaker child
-            weaker_child = succs[int(np.argmin(probs))]
-            edges_to_remove.add((d, weaker_child))
-            continue
+        # Invariant 3: Daughter Lineage Persistence (daughters must survive >= min_daughter_persistence frames after mitosis)
+        d1_t = coords[succs[0], 0]
+        at_temporal_end = (total_frames is not None and d1_t >= total_frames - min_daughter_persistence - 1)
+        if not at_temporal_end:
+            def get_fwd_len(node_idx):
+                c = node_idx
+                f_len = 0
+                while f_len < min_daughter_persistence:
+                    sc = rx_g.successors(c)
+                    if not sc:
+                        break
+                    c = sc[0]
+                    f_len += 1
+                return f_len
 
-        # Invariant 3: Galilean Co-Moving Reference Frame Invariants
+            d1_len = get_fwd_len(succs[0])
+            d2_len = get_fwd_len(succs[1])
+
+            if d1_len < min_daughter_persistence and d2_len >= min_daughter_persistence:
+                edges_to_remove.add((d, succs[0]))
+                continue
+            elif d2_len < min_daughter_persistence and d1_len >= min_daughter_persistence:
+                edges_to_remove.add((d, succs[1]))
+                continue
+            elif d1_len < min_daughter_persistence and d2_len < min_daughter_persistence:
+                weaker_child = succs[int(np.argmin(probs))]
+                edges_to_remove.add((d, weaker_child))
+                continue
+
+        # Invariant 4: Galilean Co-Moving Reference Frame Geometric Cleavage Invariants
         p_m = coords_um[d]
-        p_pred = coords_um[preds[0]]
-        v_mother = p_m - p_pred
+        if preds:
+            p_pred = coords_um[preds[0]]
+            v_mother = p_m - p_pred
+        else:
+            v_mother = np.zeros(3, dtype=np.float32)
         p_comoving = p_m + v_mother
 
         p_d1 = coords_um[succs[0]]
@@ -210,7 +229,7 @@ def prune_false_divisions(
         midpoint_offset = np.linalg.norm(p_comoving - 0.5 * (p_d1 + p_d2))
         sym_ratio = abs(d1 - d2) / (d1 + d2 + 1e-6)
 
-        if cos_spindle > cos_spindle_thresh or midpoint_offset > midpoint_thresh or sym_ratio > 0.75:
+        if cos_spindle > cos_spindle_thresh or midpoint_offset > midpoint_thresh or sym_ratio > sym_ratio_thresh:
             weaker_child = succs[int(np.argmin(probs))]
             edges_to_remove.add((d, weaker_child))
 
@@ -293,10 +312,10 @@ def track_volume_inference(
     window_size: int = 2,
     det_threshold: float = 0.50,
     edge_threshold: float = 0.48,
-    div_threshold: float = 0.28,
-    div_joint_threshold: float = 0.72,
+    div_threshold: float = 0.25,
+    div_joint_threshold: float = 0.70,
     pool_kernel_um: float = 5.0,
-    min_track_length: int = 5,
+    min_track_length: int = 4,
 ) -> tuple[np.ndarray, list[tuple[int, int, float, float]]]:
     ds = open_dataset(volume_path, normalize=False, load_image=False, downsample=downsample)
     zarr_arr = zarr.open_group(str(volume_path), mode="r")["0"]
@@ -580,7 +599,7 @@ def track_volume_inference(
                             cos_sp = float(np.dot(w1, w2) / max(n1 * n2, 1e-6))
                             mid_off = float(np.linalg.norm(0.5 * (d1 + p_t) - p_comov))
                             sym_rat = abs(n1 - n2) / (n1 + n2 + 1e-6)
-                            if cos_sp > -0.25 or mid_off > 4.50 or sym_rat > 0.85:
+                            if cos_sp > -0.40 or mid_off > 3.00 or sym_rat > 0.50:
                                 continue
                             gi, gj = int(idx_src[i]), int(idx_tgt[j])
                             all_edges.append((gi, gj, float(raw_prob), float(dist_um)))
@@ -596,7 +615,7 @@ def track_volume_inference(
     coords_clean, edges_clean = filter_short_tracks_with_gaps(
         coords_orig, all_edges, min_length=min_track_length, scale=scale, total_frames=T
     )
-    edges_clean = prune_false_divisions(coords_clean, edges_clean, scale=scale)
+    edges_clean = prune_false_divisions(coords_clean, edges_clean, scale=scale, total_frames=T)
     edges_clean = reconnect_broken_consecutive_endpoints(coords_clean, edges_clean, scale=scale)
     coords_final, edges_final = prune_isolated_degree_0_nodes(coords_clean, edges_clean)
 
