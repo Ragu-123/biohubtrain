@@ -51,6 +51,7 @@ for p in [
 import tracksdata as td
 from biohub_tracking.io import open_dataset
 from src.models import AnisoTrack3D, trilinear_index_features
+from src.models.local_transformer import log_sinkhorn_uot
 from src.kernels.triton_ops import refine_subvoxel_peaks_triton, HAS_TRITON
 from src.evaluation.benchmark_suite import BenchmarkSuite
 
@@ -504,7 +505,12 @@ def track_volume(
             # Bidirectional Consensus Soft-Veto (Forward-Backward Softmax)
             probs_bwd = torch.softmax(edge_logits_ens, dim=0).cpu().numpy()
             probs_fwd = torch.softmax(edge_logits_ens, dim=1).cpu().numpy()
-            probs = 0.85 * probs_bwd + 0.15 * probs_fwd
+            
+            # GPU Log-Domain Sinkhorn Unbalanced Optimal Transport (Audit Pillar 1)
+            cost_t = -edge_logits_ens.float()
+            uot_plan, _, _ = log_sinkhorn_uot(cost_t, eps=0.08, tau_1=1.5, tau_2=1.5, max_iter=25)
+            probs_uot = (uot_plan.cpu().numpy() * max(n_src, 1)).clip(0.0, 1.0)
+            probs = 0.50 * probs_uot + 0.40 * probs_bwd + 0.10 * probs_fwd
 
             # Directional Momentum Candidate Scoring
             candidates = []
@@ -574,17 +580,24 @@ def track_volume(
                     dist_m_d1 = float(np.linalg.norm(p_src_um - d1_um))
                     symmetry_ratio = abs(dist_m_d1 - dist_um) / (dist_m_d1 + dist_um + 1e-6)
 
-                    # Physical laws of cytokinesis spindle:
-                    v_d1 = d1_um - p_src_um
-                    v_d2 = p_tgt_um - p_src_um
-                    cos_spindle = float(np.dot(v_d1, v_d2) / (dist_m_d1 * dist_um + 1e-6))
-                    midpoint_offset = float(np.linalg.norm(p_src_um - 0.5 * (d1_um + p_tgt_um)))
+                    # Galilean-Invariant Spindle Geometry (Audit Pillar 3):
+                    # Compute displacements in the co-moving reference frame of the mother cell:
+                    gi = int(idx_src[i])
+                    v_drift = velocity_buffer.get(gi, np.zeros(3, dtype=np.float32))
+                    p_comoving = p_src_um + v_drift
+
+                    w1 = d1_um - p_comoving
+                    w2 = p_tgt_um - p_comoving
+                    norm_w1 = float(np.linalg.norm(w1))
+                    norm_w2 = float(np.linalg.norm(w2))
+                    cos_spindle = float(np.dot(w1, w2) / (max(norm_w1 * norm_w2, 1e-6)))
+                    midpoint_offset = float(np.linalg.norm(p_comoving - 0.5 * (d1_um + p_tgt_um)))
 
                     if (
                         dist_um > 8.54
                         or dist_sisters > 15.34
                         or symmetry_ratio > 0.85
-                        or cos_spindle > -0.15
+                        or cos_spindle > -0.25
                         or midpoint_offset > 4.50
                     ):
                         continue

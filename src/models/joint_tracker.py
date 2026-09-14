@@ -1,10 +1,12 @@
 """
 AnisoTrack3D: End-to-End Joint Model.
 Combines:
-1. AnisoUNet3D: Anisotropic spatial-axial separable 3D conv backbone
-2. SubVoxelDetectionHead: Continuous sub-voxel peak detector & parabolic refiner
-3. Differentiable Trilinear Feature Sampling (F.grid_sample)
-4. SparseLocalTrackTransformer: Local ball graph attention
+1. AnisoUNet3D: Anisotropic spatial-axial factorized 3D UNet with Dual-Stream Laplacian
+2. SubVoxelDetectionHead: Continuous sub-voxel peak detector & algebraic rational refiner
+3. DiffeomorphicFlowHead: Continuous 3D Lie group flow field
+4. Differentiable Trilinear Feature Sampling (F.grid_sample / Triton)
+5. SparseLocalTrackTransformer: Local ball graph attention with Anisotropic Fourier Harmonics
+6. GPU Log-Domain Sinkhorn Unbalanced Optimal Transport (UOT)
 """
 
 import torch
@@ -12,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .aniso_unet import AnisoUNet3D
-from .local_transformer import SparseLocalTrackTransformer
+from .local_transformer import SparseLocalTrackTransformer, log_sinkhorn_uot
 
 
 try:
@@ -28,7 +30,7 @@ def trilinear_index_features(feat_map: torch.Tensor, coords: torch.Tensor) -> to
     """
     Differentiable feature sampling at continuous coordinates.
     feat_map: (B=1, C, Z, Y, X) or (C, Z, Y, X)
-    coords:   (N, 3) continuous coordinates (z, y, x)
+    coords:   (N, 3) continuous coordinates (z, y, x) in voxels
     Returns:  (N, C) feature vectors.
     """
     if feat_map.dim() == 5:
@@ -41,9 +43,9 @@ def trilinear_index_features(feat_map: torch.Tensor, coords: torch.Tensor) -> to
         return trilinear_index_triton(feat_map, coords)
 
     # PyTorch fallback
-    z_n = (coords[:, 0] / (Z - 1.0)) * 2.0 - 1.0
-    y_n = (coords[:, 1] / (Y - 1.0)) * 2.0 - 1.0
-    x_n = (coords[:, 2] / (X - 1.0)) * 2.0 - 1.0
+    z_n = (coords[:, 0] / max(Z - 1.0, 1.0)) * 2.0 - 1.0
+    y_n = (coords[:, 1] / max(Y - 1.0, 1.0)) * 2.0 - 1.0
+    x_n = (coords[:, 2] / max(X - 1.0, 1.0)) * 2.0 - 1.0
     grid = torch.stack([x_n, y_n, z_n], dim=-1).view(1, 1, 1, -1, 3)
     sampled = F.grid_sample(feat_map.unsqueeze(0), grid, mode="bilinear", padding_mode="border", align_corners=False)
     return sampled.squeeze(0).squeeze(1).squeeze(1).t()
@@ -60,14 +62,17 @@ class AnisoTrack3D(nn.Module):
         r_max_um: float = 12.0,
         depthwise: bool = True,
         use_checkpointing: bool = True,
+        scale: tuple[float, float, float] = (1.625, 0.40625, 0.40625),
     ):
         super().__init__()
+        self.scale = scale
         self.unet = AnisoUNet3D(
             in_channels=in_channels,
             out_channels=unet_out_channels,
             layer_channels=unet_layers,
             depthwise=depthwise,
             use_checkpointing=use_checkpointing,
+            scale=scale,
         )
         self.transformer = SparseLocalTrackTransformer(
             feat_dim=unet_out_channels,
@@ -77,15 +82,23 @@ class AnisoTrack3D(nn.Module):
             r_max_um=r_max_um,
         )
 
-    def encode(self, imgs: torch.Tensor):
+    def encode(self, imgs: torch.Tensor, return_flows: bool = False):
         """
         imgs: (B, W, 1, Z, Y, X)
         Returns:
             feats: (B, W, C, Z, Y, X)
             det_logits: list of (B, 1, Z, Y, X)
             sub_deltas: list of (B, 3, Z, Y, X)
+            flows: list of (v, disp) tuples if return_flows=True
         """
-        return self.unet(imgs)
+        return self.unet(imgs, return_flows=return_flows)
+
+    def sample_features(self, feat_map: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        return trilinear_index_features(feat_map, coords)
+
+    def sample_flows(self, flow_map: torch.Tensor, coords: torch.Tensor) -> torch.Tensor:
+        """Samples continuous 3D velocity vectors (v_z, v_y, v_x) at cell coordinates."""
+        return trilinear_index_features(flow_map, coords)
 
     def predict_edges(
         self,
@@ -93,8 +106,21 @@ class AnisoTrack3D(nn.Module):
         coords_src_um: torch.Tensor,
         feat_tgt: torch.Tensor,
         coords_tgt_um: torch.Tensor,
+        flow_src_um: torch.Tensor = None,
     ):
         """
         Computes pairwise transition logits between source and target cells.
         """
-        return self.transformer(feat_src, coords_src_um, feat_tgt, coords_tgt_um)
+        return self.transformer(feat_src, coords_src_um, feat_tgt, coords_tgt_um, flow_src_um=flow_src_um)
+
+    def decode_edges(
+        self,
+        logits: torch.Tensor,
+        dist_um: torch.Tensor = None,
+        use_uot: bool = True,
+        threshold: float = 0.20,
+    ) -> torch.Tensor:
+        if use_uot:
+            return self.transformer.decode_uot_edges(logits, dist_um=dist_um, prob_threshold=threshold)
+        else:
+            return self.transformer.decode_edges(logits, threshold=threshold)
