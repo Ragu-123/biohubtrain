@@ -778,11 +778,21 @@ def main():
             total_nodes += len(coords)
             total_edges += len(edges)
 
+    # If running on Kaggle, also copy directly to /kaggle/working/submission.csv
+    kaggle_working = Path("/kaggle/working")
+    if kaggle_working.exists():
+        import shutil
+        target_root = kaggle_working / "submission.csv"
+        if out_csv.resolve() != target_root.resolve():
+            shutil.copy(out_csv, target_root)
+            print(f"   Synchronized to: {target_root.resolve()}")
+
     print("=" * 85)
     print(f"✅ SUBMISSION COMPLETE: {out_csv.resolve()}")
     print(f"   Total Rows Written: {row_id} (Nodes: {total_nodes}, Edges: {total_edges})")
     print(f"   File Size: {out_csv.stat().st_size / (1024 ** 2):.2f} MB")
     print("=" * 85)
+    sys.stdout.flush()
 
 
 if __name__ == "__main__":
