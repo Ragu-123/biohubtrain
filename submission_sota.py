@@ -34,6 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 for p in [
     "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/src",
     "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/scripts",
+    "/kaggle/input/forcompbiohub/repo/src",
+    "/kaggle/input/forcompbiohub/repo/scripts",
 ]:
     if p not in sys.path and Path(p).exists():
         sys.path.insert(0, p)
@@ -374,7 +376,7 @@ def track_volume_inference(
 
     primary_device = models[0][1]
 
-    for ws in tqdm(window_starts, desc=f"  Tracking {volume_path.stem}", leave=False):
+    for ws in tqdm(window_starts, desc=f"  Tracking {volume_path.stem}", leave=False, file=sys.stdout):
         frame_indices = list(range(ws, ws + window_size))
         imgs_raw = []
         for t in frame_indices:
@@ -653,40 +655,71 @@ def main():
     print("      ANISOTRACK3D-ENSEMBLE KAGGLE PRODUCTION SUBMISSION GENERATOR")
     print("=" * 85)
 
-    test_dir = Path("/kaggle/input/competitions/biohub-cell-tracking-during-development/test")
-    if not test_dir.exists():
-        # Fallback to train for verification
-        test_dir = Path("/kaggle/input/competitions/biohub-cell-tracking-during-development/train")
+    possible_test_dirs = [
+        Path("/kaggle/input/competitions/biohub-cell-tracking-during-development/test"),
+        Path("/kaggle/input/biohub-cell-tracking-during-development/test"),
+    ]
+    possible_train_dirs = [
+        Path("/kaggle/input/competitions/biohub-cell-tracking-during-development/train"),
+        Path("/kaggle/input/biohub-cell-tracking-during-development/train"),
+    ]
+
+    test_dir = None
+    is_test = True
+    for td in possible_test_dirs:
+        if td.exists():
+            test_dir = td
+            break
+
+    if test_dir is None:
         is_test = False
-    else:
-        is_test = True
+        for trd in possible_train_dirs:
+            if trd.exists():
+                test_dir = trd
+                break
+
+    if test_dir is None:
+        raise FileNotFoundError("Could not find test or train directory on Kaggle!")
 
     test_volumes = sorted(list(test_dir.glob("*.zarr")))
     if not is_test:
         test_volumes = test_volumes[:2]  # run 2 volumes for verification
 
-    print(f"Discovered {len(test_volumes)} volume(s) in {test_dir}")
+    print(f"Discovered {len(test_volumes)} volume(s) in {test_dir} (is_test={is_test})")
 
     device_0 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     device_1 = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
 
-    weight_paths = [
+    weight_candidates = [
+        "/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth",
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth",
-        "/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
+        "/kaggle/input/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
+        "/kaggle/input/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth",
+        "/kaggle/input/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth",
     ]
 
     loaded_models = []
+    loaded_canonical = set()
     downsample = (1, 4, 4)
     window_size = 2
 
-    for idx, wp in enumerate(weight_paths):
+    for wp in weight_candidates:
         p = Path(wp)
         if p.exists():
-            dev = device_1 if (idx % 2 == 1 and torch.cuda.device_count() > 1) else device_0
-            print(f"Loading Model {idx + 1} on {dev}: {p.name}")
+            resolved_p = p.resolve()
+            # De-duplicate identical files or splits
+            split_key = f"{p.parent.parent.name}_{p.parent.name}"
+            if split_key in loaded_canonical:
+                continue
+            loaded_canonical.add(split_key)
+
+            dev = device_1 if (len(loaded_models) % 2 == 1 and torch.cuda.device_count() > 1) else device_0
+            print(f"Loading Model {len(loaded_models) + 1} on {dev}: {split_key}/{p.name}")
             m, window_size, downsample = load_model(p, dev)
             loaded_models.append((m, dev))
+            if len(loaded_models) >= 3:
+                break
 
     out_csv = Path("submission.csv")
     row_id = 0
@@ -697,7 +730,7 @@ def main():
         writer = csv.DictWriter(f, fieldnames=SUBMISSION_COLUMNS)
         writer.writeheader()
 
-        for vol_p in test_volumes:
+        for vol_p in tqdm(test_volumes, desc="Overall Submission Progress", file=sys.stdout):
             dataset_name = vol_p.stem
             t0 = time.perf_counter()
             coords, edges = track_volume_inference(
