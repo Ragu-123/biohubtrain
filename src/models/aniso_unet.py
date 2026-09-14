@@ -338,15 +338,19 @@ class AnisoUNet3D(nn.Module):
         v, disp = self.flow_head(feat)
         return feat, det_logits, sub_deltas, (v, disp)
 
-    def forward(self, x: torch.Tensor, return_flows: bool = False):
+    def forward(self, x: torch.Tensor, return_flows: bool = False, return_sub_deltas: bool = False):
         """
-        Input x: (B, W, 1, Z, Y, X)
+        Input x: (B, W, 1, Z, Y, X) or (B, W, Z, Y, X) or (B, Z, Y, X)
         Returns:
-            feats: (B, W, C_out, Z, Y, X)
-            det_logits: list of (B, 1, Z, Y, X) for each frame in W
-            sub_deltas: list of (B, 3, Z, Y, X) for each frame in W
-            flows (optional): list of (v, disp) tuples if return_flows=True
+            if return_flows: (feats, det_logits, sub_deltas, flows)
+            elif return_sub_deltas: (feats, det_logits, sub_deltas)
+            else: (feats, det_logits)
         """
+        if x.dim() == 4:
+            x = x.unsqueeze(1).unsqueeze(2)
+        elif x.dim() == 5:
+            x = x.unsqueeze(2)
+
         B, W, C, Z, Y, X = x.shape
         feats = []
         det_logits = []
@@ -363,4 +367,6 @@ class AnisoUNet3D(nn.Module):
         feats = torch.stack(feats, dim=1)  # (B, W, C_out, Z, Y, X)
         if return_flows:
             return feats, det_logits, sub_deltas, flows
-        return feats, det_logits, sub_deltas
+        if return_sub_deltas:
+            return feats, det_logits, sub_deltas
+        return feats, det_logits

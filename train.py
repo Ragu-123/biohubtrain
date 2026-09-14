@@ -112,6 +112,8 @@ def evaluate_checkpoint(model, data_dir: Path, val_volumes: list[str], downsampl
             print(f"    - Census Multiplier : {res['census_multiplier']:.4f}")
             print(f"    - Latency           : {lat:.2f}s | VRAM: {vram:.1f} MB")
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             print(f"  [Validation {v_name}] Error during evaluation: {e}")
 
     print("=" * 82)

@@ -82,16 +82,15 @@ class AnisoTrack3D(nn.Module):
             r_max_um=r_max_um,
         )
 
-    def encode(self, imgs: torch.Tensor, return_flows: bool = False):
+    def encode(self, imgs: torch.Tensor, return_flows: bool = False, return_sub_deltas: bool = False):
         """
-        imgs: (B, W, 1, Z, Y, X)
+        imgs: (B, W, 1, Z, Y, X) or (B, W, Z, Y, X)
         Returns:
-            feats: (B, W, C, Z, Y, X)
-            det_logits: list of (B, 1, Z, Y, X)
-            sub_deltas: list of (B, 3, Z, Y, X)
-            flows: list of (v, disp) tuples if return_flows=True
+            if return_flows: (feats, det_logits, sub_deltas, flows)
+            elif return_sub_deltas: (feats, det_logits, sub_deltas)
+            else: (feats, det_logits) for evaluate.py / submission_sota.py compatibility
         """
-        return self.unet(imgs, return_flows=return_flows)
+        return self.unet(imgs, return_flows=return_flows, return_sub_deltas=return_sub_deltas)
 
     def _index_features(self, feat_map: torch.Tensor, coords: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         if coords.dim() == 3:
