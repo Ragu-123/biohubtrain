@@ -93,7 +93,7 @@ std::vector<torch::Tensor> fast_greedy_track(
             float d2_x = c_tgt[j * 3 + 2];
 
             float d_sis = std::sqrt((d1_z - d2_z)*(d1_z - d2_z) + (d1_y - d2_y)*(d1_y - d2_y) + (d1_x - d2_x)*(d1_x - d2_x));
-            if (d_sis > 15.34f || dist_um > 8.54f) continue;
+            if (d_sis < 4.50f || d_sis > 15.50f || dist_um > 8.54f) continue;
 
             // Galilean Co-Moving Reference Frame (Audit Pillar 3)
             float s_z = c_src[i * 3 + 0] + drifts[i * 3 + 0];
@@ -116,7 +116,7 @@ std::vector<torch::Tensor> fast_greedy_track(
 
             float sym_ratio = std::abs(norm1 - norm2) / (norm1 + norm2 + 1e-6f);
 
-            if (cos_spindle > -0.40f || midpoint_offset > 3.00f || sym_ratio > 0.50f) continue;
+            if (cos_spindle > -0.55f || midpoint_offset > 2.20f || sym_ratio > 0.45f) continue;
 
             out_src.push_back(i);
             out_tgt.push_back(j);
@@ -158,7 +158,7 @@ def get_cpp_tracker():
     try:
         from torch.utils.cpp_extension import load_inline
         _CPP_TRACKER_MODULE = load_inline(
-            name="fast_tracker_cpp_v2",
+            name="fast_tracker_cpp_v3",
             cpp_sources=CPP_TRACKER_SOURCE,
             functions=["fast_greedy_track"],
             verbose=False,
