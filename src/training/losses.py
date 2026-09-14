@@ -25,29 +25,21 @@ class AnisoTrackingLoss(nn.Module):
         self.subvoxel_loss_weight = subvoxel_loss_weight
         self.focal_gamma = focal_gamma
 
-    def edge_loss(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def edge_loss(self, logits: torch.Tensor, target: torch.Tensor, cand_mask: torch.Tensor = None) -> torch.Tensor:
         if logits.numel() == 0 or target.numel() == 0:
             return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
-        active_rows = target.sum(dim=1) > 0
-        active_cols = target.sum(dim=0) > 0
-        mask = active_rows.unsqueeze(1) | active_cols.unsqueeze(0)
-        if not mask.any():
+        if cand_mask is None:
+            cand_mask = logits > -1e3
+
+        if not cand_mask.any():
             return torch.tensor(0.0, device=logits.device, requires_grad=True)
 
         with torch.amp.autocast('cuda', enabled=False):
-            logits_f = logits.float()
-            target_f = target.float()
-            probs = torch.softmax(logits_f, dim=0).clamp(min=1e-7, max=1.0 - 1e-7)
-            bce = F.binary_cross_entropy(probs, target_f, reduction="none")
-            p_t = probs * target_f + (1.0 - probs) * (1.0 - target_f)
-            focal_weight = (1.0 - p_t) ** self.focal_gamma
-
-            div_rows = target_f.sum(dim=1) > 1
-            div_mult = torch.ones_like(bce)
-            div_mult[div_rows] = 1.2
-
-            return (focal_weight * bce * div_mult)[mask].mean()
+            active_logits = logits[cand_mask].float()
+            active_targets = target[cand_mask].float()
+            pos_weight = torch.tensor([5.0], device=logits.device)
+            return F.binary_cross_entropy_with_logits(active_logits, active_targets, pos_weight=pos_weight)
 
     def detection_loss(self, det_logits: torch.Tensor, gt_peak_mask: torch.Tensor) -> torch.Tensor:
         with torch.amp.autocast('cuda', enabled=False):
@@ -75,8 +67,9 @@ class AnisoTrackingLoss(nn.Module):
         gt_peak_masks: list,
         pred_deltas_list: list = None,
         target_deltas_list: list = None,
+        cand_mask: torch.Tensor = None,
     ):
-        l_edge = self.edge_loss(edge_logits, edge_targets)
+        l_edge = self.edge_loss(edge_logits, edge_targets, cand_mask=cand_mask)
         
         l_det = sum(
             self.detection_loss(log, gt)

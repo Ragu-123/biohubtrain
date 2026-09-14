@@ -23,6 +23,16 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+import polars as pl
+if not hasattr(pl, "Float16"):
+    pl.Float16 = pl.Float32
+try:
+    import polars._utils.various as _pl_various
+    if not hasattr(_pl_various, "NO_DEFAULT"):
+        _pl_various.NO_DEFAULT = getattr(_pl_various, "NoDefault", object())
+except Exception:
+    pass
+
 # Add repo and support paths
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 for p in [
@@ -181,7 +191,7 @@ def main():
                     gt_masks = [m.to(device) for m in item["peak_masks"]]
                     det_logs = [det_logits[0][b:b+1], det_logits[1][b:b+1]]
 
-                    sample_loss, loss_dict = loss_fn(edge_logits, target, det_logs, gt_masks)
+                    sample_loss, loss_dict = loss_fn(edge_logits, target, det_logs, gt_masks, cand_mask=cand_mask)
                     batch_total_loss = batch_total_loss + sample_loss
                     edge_loss_sum += loss_dict["loss_edge"]
                     det_loss_sum += loss_dict["loss_det"]

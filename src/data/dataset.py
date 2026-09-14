@@ -10,6 +10,17 @@ from typing import Optional, List, Tuple
 
 import numpy as np
 import polars as pl
+
+if not hasattr(pl, "Float16"):
+    pl.Float16 = pl.Float32
+
+try:
+    import polars._utils.various as _pl_various
+    if not hasattr(_pl_various, "NO_DEFAULT"):
+        _pl_various.NO_DEFAULT = getattr(_pl_various, "NoDefault", object())
+except Exception:
+    pass
+
 import torch
 import torch.nn.functional as F
 import zarr

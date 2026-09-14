@@ -100,7 +100,7 @@ class SparseLocalTrackTransformer(nn.Module):
         pos_dim: int = 32,
         d_model: int = 64,
         n_layers: int = 3,
-        r_max_um: float = 12.0,
+        r_max_um: float = 10.0,
     ):
         super().__init__()
         self.r_max_um = r_max_um
@@ -117,12 +117,11 @@ class SparseLocalTrackTransformer(nn.Module):
         ])
 
         # Pairwise scoring MLP
-        # Input: [h_u, h_v, delta_pos, distance_um] -> (D + D + 3 + 1)
         in_pair_dim = d_model * 2 + 4
         self.pair_mlp = nn.Sequential(
             nn.Linear(in_pair_dim, d_model),
             nn.GELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.1),
             nn.Linear(d_model, d_model // 2),
             nn.GELU(),
             nn.Linear(d_model // 2, 1),
@@ -160,26 +159,45 @@ class SparseLocalTrackTransformer(nn.Module):
         h_tgt = self.input_proj(torch.cat([feat_tgt, pos_tgt], dim=-1))
 
         # 3. Bidirectional sparse cross-attention
-        # Forward: target queries source
         for layer in self.fwd_layers:
             h_tgt = layer(h_tgt, h_src, mask=cand_mask_rev)
-        # Reverse: source queries target
         for layer in self.rev_layers:
             h_src = layer(h_src, h_tgt, mask=cand_mask_fwd)
 
         # 4. Sparse pairwise edge scoring only on candidate pairs
-        logits = torch.full((N, M), -1e4, device=feat_src.device, dtype=feat_src.dtype)
+        logits = torch.full((N, M), -1e4, device=feat_src.device, dtype=h_src.dtype)
         cand_indices = torch.nonzero(cand_mask_fwd, as_tuple=True)
         si, tj = cand_indices
 
         if len(si) > 0:
             h_s_active = h_src[si]
             h_t_active = h_tgt[tj]
-            diff_active = diff[si, tj] / 10.0
-            dist_active = dist_um[si, tj].unsqueeze(-1) / 10.0
+            diff_active = (diff[si, tj] / 10.0).to(h_s_active.dtype)
+            dist_active = (dist_um[si, tj].unsqueeze(-1) / 10.0).to(h_s_active.dtype)
 
             active_pair_feats = torch.cat([h_s_active, h_t_active, diff_active, dist_active], dim=-1)
             active_logits = self.pair_mlp(active_pair_feats).squeeze(-1)
             logits[si, tj] = active_logits
 
         return logits, cand_mask_fwd
+
+    @torch.no_grad()
+    def decode_edges(self, logits: torch.Tensor, threshold: float = 0.35) -> torch.Tensor:
+        """
+        Greedy zero-merger decoding: enforces each target cell has at most 1 parent.
+        Returns binary transition matrix (N, M).
+        """
+        probs = torch.sigmoid(logits.float())
+        N, M = probs.shape
+        binary_edges = torch.zeros((N, M), dtype=torch.float32, device=logits.device)
+        if N == 0 or M == 0:
+            return binary_edges
+
+        # Column-wise greedy selection (each target chooses single best parent >= threshold)
+        best_vals, best_indices = probs.max(dim=0)
+        valid_targets = torch.nonzero(best_vals >= threshold).squeeze(-1)
+        if valid_targets.numel() > 0:
+            valid_sources = best_indices[valid_targets]
+            binary_edges[valid_sources, valid_targets] = 1.0
+
+        return binary_edges
