@@ -104,12 +104,13 @@ def evaluate_checkpoint(model, data_dir: Path, val_volumes: list[str], downsampl
                 min_track_length=4,
             )
             res = suite.evaluate_graph(pred_graph, v_name, lat, vram)
-            scores.append(res["combined_score"])
+            scores.append(res.competition_score)
             print(f"  [Validation {v_name}]")
-            print(f"    - Score             : {res['combined_score']:.4f}")
-            print(f"    - Edge Jaccard      : {res['edge_jaccard']:.4f}")
-            print(f"    - Division Jaccard  : {res['division_jaccard']:.4f}")
-            print(f"    - Census Multiplier : {res['census_multiplier']:.4f}")
+            print(f"    - Score             : {res.competition_score:.4f}")
+            print(f"    - Adj Edge Jaccard  : {res.adj_edge_jaccard:.4f} (Raw: {res.raw_edge_jaccard:.4f})")
+            print(f"    - Edge Counts       : TP={res.edge_tp}, FP={res.edge_fp}, FN={res.edge_fn}")
+            print(f"    - Division Jaccard  : {res.div_jaccard:.4f} (TP={res.div_tp}, FP={res.div_fp}, FN={res.div_fn})")
+            print(f"    - Census Multiplier : {res.census_multiplier:.4f}")
             print(f"    - Latency           : {lat:.2f}s | VRAM: {vram:.1f} MB")
         except Exception as e:
             import traceback
