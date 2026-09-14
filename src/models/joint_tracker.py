@@ -115,7 +115,7 @@ class AnisoTrack3D(nn.Module):
             c_s = c.squeeze(0) if c.dim() == 3 else c
             c_t = d.squeeze(0) if d.dim() == 3 else d
             logits, cand_mask = self.transformer(f_s, c_s, f_t, c_t)
-            return logits.unsqueeze(0), cand_mask.unsqueeze(0)
+            return logits, cand_mask
         else:
             # train.py: (feat_src, coords_src_um, feat_tgt, coords_tgt_um)
             f_s = a.squeeze(0) if a.dim() == 3 else a

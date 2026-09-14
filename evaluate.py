@@ -503,11 +503,18 @@ def track_volume(
                         p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
                         p_pos_src, p_pos_tgt,
                         p_mask_src, p_mask_tgt,
-                    )[0].to(primary_device)
+                    )
+                    if isinstance(el, (tuple, list)):
+                        el = el[0]
+                    if el.dim() == 3:
+                        el = el.squeeze(0)
+                    el = el.to(primary_device)
                 edge_logits_models.append(el)
 
             # Consensus Ensemble Edge Logits
             edge_logits_ens = sum(edge_logits_models) / len(edge_logits_models)
+            if edge_logits_ens.dim() == 3:
+                edge_logits_ens = edge_logits_ens.squeeze(0)
 
             # Bidirectional Consensus Soft-Veto on GPU
             probs_gpu = 0.85 * torch.softmax(edge_logits_ens, dim=0) + 0.15 * torch.softmax(edge_logits_ens, dim=1)
