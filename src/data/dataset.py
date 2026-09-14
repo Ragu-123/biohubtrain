@@ -68,9 +68,10 @@ class BiohubWindowDataset(Dataset):
 
         if volume_names is None:
             geffs = sorted(list(self.data_dir.glob("*.geff")))
+            val_set = {"44b6_3a861e03", "44b6_12dfb391"}
+            volume_names = [g.stem for g in geffs if g.stem not in val_set]
             if num_volumes is not None:
-                geffs = geffs[:num_volumes]
-            volume_names = [g.stem for g in geffs]
+                volume_names = volume_names[:num_volumes]
 
         self.samples = []
         ds_arr = np.array(downsample, dtype=np.float32)
