@@ -41,6 +41,8 @@ sys.path.insert(0, repo_root)
 for p in [
     "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/src",
     "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/scripts",
+    "/kaggle/input/forcompbiohub/repo/src",
+    "/kaggle/input/forcompbiohub/repo/scripts",
 ]:
     if p not in sys.path and Path(p).exists():
         sys.path.append(p)
@@ -53,7 +55,7 @@ from src.evaluation.benchmark_suite import BenchmarkSuite
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Bio-DANT Model")
-    parser.add_argument("--data-dir", type=str, required=True, help="Path to train directory with .zarr and .geff")
+    parser.add_argument("--data-dir", type=str, default=None, help="Path to train directory with .zarr and .geff")
     parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
     parser.add_argument("--batch-size", type=int, default=2, help="Batch size (frame pairs)")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
@@ -131,6 +133,26 @@ def evaluate_checkpoint(model, data_dir: Path, val_volumes: list[str], downsampl
 def main():
     args = parse_args()
     downsample = tuple(int(x) for x in args.downsample.split(","))
+
+    if args.data_dir is None:
+        for p in [
+            Path("/kaggle/input/competitions/biohub-cell-tracking-during-development/train"),
+            Path("/kaggle/input/biohub-cell-tracking-during-development/train"),
+        ]:
+            if p.exists():
+                args.data_dir = str(p)
+                break
+    if args.data_dir is None:
+        raise FileNotFoundError("Could not find competition train directory!")
+
+    if args.pretrained is None:
+        for p in [
+            Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth"),
+            Path("/kaggle/input/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth"),
+        ]:
+            if p.exists():
+                args.pretrained = str(p)
+                break
 
     print("=" * 82)
     print("             BIO-DANT HIGH-PERFORMANCE TRAINING PIPELINE")
