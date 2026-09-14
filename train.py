@@ -66,6 +66,8 @@ def parse_args():
     parser.add_argument("--val-volumes", type=str, default="44b6_3a861e03,44b6_12dfb391", help="Comma-separated validation volumes")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save weights")
     parser.add_argument("--pretrained", type=str, default=None, help="Path to pre-trained weights (.pth)")
+    parser.add_argument("--no-val", action="store_true", help="Skip validation evaluation during training")
+    parser.add_argument("--val-max-frames", type=int, default=15, help="Max frames for validation evaluation")
     return parser.parse_args()
 
 
@@ -73,7 +75,7 @@ def custom_collate(batch):
     return batch
 
 
-def evaluate_checkpoint(model, data_dir: Path, val_volumes: list[str], downsample: tuple, device: torch.device):
+def evaluate_checkpoint(model, data_dir: Path, val_volumes: list[str], downsample: tuple, device: torch.device, val_max_frames: int | None = 15):
     """Evaluates the model on validation volumes using the official metric engine."""
     import importlib.util
     eval_path = Path(__file__).resolve().parent / "evaluate.py"
@@ -96,7 +98,7 @@ def evaluate_checkpoint(model, data_dir: Path, val_volumes: list[str], downsampl
         try:
             _, _, n_total = suite.load_gt(v_name)
             pred_graph, lat, vram = track_volume(
-                models=model,
+                models=[(model, device)],
                 volume_dir=vol_path,
                 device=device,
                 downsample=downsample,
@@ -106,6 +108,7 @@ def evaluate_checkpoint(model, data_dir: Path, val_volumes: list[str], downsampl
                 det_tta=False,
                 n_total=n_total,
                 min_track_length=4,
+                max_frames=val_max_frames,
             )
             res = suite.evaluate_graph(pred_graph, v_name, lat, vram)
             scores.append(res.competition_score)
@@ -183,7 +186,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=custom_collate,
-        num_workers=2 if sys.platform != "win32" else 0,
+        num_workers=0,  # Zero workers prevents Zarr/Blosc thread-fork deadlocks on Linux
         pin_memory=False,
     )
 
@@ -235,7 +238,8 @@ def main():
 
     for epoch in range(args.epochs):
         model.train()
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", file=sys.stdout, ncols=95, mininterval=1.0)
+        print(f"\n--- Epoch {epoch+1}/{args.epochs} Starting: {len(dataloader)} batches to process ---", flush=True)
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{args.epochs}", file=sys.stdout, ncols=95, mininterval=0.5)
         for batch_idx, batch in enumerate(pbar):
             t0 = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
@@ -316,8 +320,8 @@ def main():
                 "adv": f"{adv_loss_sum/B:.3f}",
                 "p/s": f"{throughput:.1f}"
             })
-            if global_step % 10 == 0:
-                pbar.write(f"Epoch {epoch+1:<2} | Step {global_step:<5} | Loss: {loss.item():.4f} (Edge: {edge_loss_sum/B:.4f}, Det: {det_loss_sum/B:.4f}, Adv: {adv_loss_sum/B:.4f}) | {throughput:.1f} p/s")
+            pbar.write(f"Epoch {epoch+1:<2} | Step {global_step:<5} | Loss: {loss.item():.4f} (Edge: {edge_loss_sum/B:.4f}, Det: {det_loss_sum/B:.4f}, Adv: {adv_loss_sum/B:.4f}) | {throughput:.1f} p/s")
+            sys.stdout.flush()
 
         # Save checkpoint per epoch
         raw_model = model.unet.module if hasattr(model.unet, "module") else model.unet
@@ -331,10 +335,10 @@ def main():
         print(f"\U0001f4be Saved checkpoint: {ckpt_path.name}")
 
         # Run Validation Evaluation immediately after epoch 1 and subsequent epochs
-        if val_volume_list:
+        if not args.no_val and val_volume_list:
             model.eval()
             with torch.no_grad():
-                val_score = evaluate_checkpoint(model, Path(args.data_dir), val_volume_list, downsample, device)
+                val_score = evaluate_checkpoint(model, Path(args.data_dir), val_volume_list, downsample, device, val_max_frames=args.val_max_frames)
                 if val_score is not None and val_score > best_val_score:
                     best_val_score = val_score
                     best_ckpt = save_dir / "biodant_best.pth"
