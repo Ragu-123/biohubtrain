@@ -176,12 +176,13 @@ def prune_false_divisions(
     coords: np.ndarray,
     edges: list[tuple[int, int, float, float]],
     scale: tuple[float, ...],
-    cos_spindle_thresh: float = -0.15,
-    midpoint_thresh: float = 4.50,
-    min_prob: float = 0.45,
+    cos_spindle_thresh: float = -0.45,
+    midpoint_thresh: float = 3.20,
+    min_prob: float = 0.50,
 ) -> list[tuple[int, int, float, float]]:
     """
     Prune spurious second-daughter edges from non-dividing cells that cause division FPs.
+    Enforces Galilean comoving reference frame and audited physical invariants.
     """
     if not edges:
         return edges
@@ -217,18 +218,23 @@ def prune_false_divisions(
             continue
 
         p_m = coords_um[d]
+        p_pred = coords_um[preds[0]]
+        v_mother = p_m - p_pred
+        p_comoving = p_m + v_mother
+
         p_d1 = coords_um[succs[0]]
         p_d2 = coords_um[succs[1]]
 
-        v1 = p_d1 - p_m
-        v2 = p_d2 - p_m
-        d1 = np.linalg.norm(v1)
-        d2 = np.linalg.norm(v2)
+        w1 = p_d1 - p_comoving
+        w2 = p_d2 - p_comoving
+        d1 = np.linalg.norm(w1)
+        d2 = np.linalg.norm(w2)
 
-        cos_spindle = np.dot(v1, v2) / (d1 * d2 + 1e-6)
-        midpoint_offset = np.linalg.norm(p_m - 0.5 * (p_d1 + p_d2))
+        cos_spindle = np.dot(w1, w2) / (d1 * d2 + 1e-6)
+        midpoint_offset = np.linalg.norm(p_comoving - 0.5 * (p_d1 + p_d2))
+        sym_ratio = abs(d1 - d2) / (d1 + d2 + 1e-6)
 
-        if cos_spindle > cos_spindle_thresh or midpoint_offset > midpoint_thresh:
+        if cos_spindle > cos_spindle_thresh or midpoint_offset > midpoint_thresh or sym_ratio > 0.60:
             weaker_child = succs[int(np.argmin(probs))]
             edges_to_remove.add((d, weaker_child))
 
@@ -622,7 +628,7 @@ def track_volume(
                             cos_sp = float(np.dot(w1, w2) / max(n1 * n2, 1e-6))
                             mid_off = float(np.linalg.norm(0.5 * (d1 + p_t) - p_comov))
                             sym_rat = abs(n1 - n2) / (n1 + n2 + 1e-6)
-                            if cos_sp > -0.25 or mid_off > 4.50 or sym_rat > 0.85:
+                            if cos_sp > -0.45 or mid_off > 3.20 or sym_rat > 0.60:
                                 continue
                             gi, gj = int(idx_src[i]), int(idx_tgt[j])
                             all_edges.append((gi, gj, float(raw_prob), float(dist_um)))
