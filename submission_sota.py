@@ -614,7 +614,7 @@ def track_volume_inference(
                                 continue
                             d1 = mother_daughters[i]
                             dist_sis = float(np.linalg.norm(d1 - p_t))
-                            if dist_sis > 15.34 or dist_um > 8.54:
+                            if dist_sis < 8.00 or dist_sis > 16.00 or dist_um > 8.54:
                                 continue
                             v_drift = v_prev_np[i]
                             p_comov = p_s + v_drift
@@ -625,7 +625,7 @@ def track_volume_inference(
                             cos_sp = float(np.dot(w1, w2) / max(n1 * n2, 1e-6))
                             mid_off = float(np.linalg.norm(0.5 * (d1 + p_t) - p_comov))
                             sym_rat = abs(n1 - n2) / (n1 + n2 + 1e-6)
-                            if cos_sp > -0.40 or mid_off > 3.00 or sym_rat > 0.50:
+                            if cos_sp > -0.60 or mid_off > 2.40 or sym_rat > 0.25:
                                 continue
                             gi, gj = int(idx_src[i]), int(idx_tgt[j])
                             all_edges.append((gi, gj, float(raw_prob), float(dist_um)))
