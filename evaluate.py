@@ -178,14 +178,14 @@ def prune_false_divisions(
     coords: np.ndarray,
     edges: list[tuple[int, int, float, float]],
     scale: tuple[float, ...],
-    cos_spindle_thresh: float = -0.55,
-    midpoint_thresh: float = 2.20,
-    sym_ratio_thresh: float = 0.45,
-    min_sister_dist_um: float = 4.50,
-    max_sister_dist_um: float = 15.50,
+    cos_spindle_thresh: float = -0.60,
+    midpoint_thresh: float = 2.40,
+    sym_ratio_thresh: float = 0.25,
+    min_sister_dist_um: float = 8.00,
+    max_sister_dist_um: float = 16.00,
     min_prob: float = 0.25,
-    min_mother_history: int = 2,
-    min_daughter_persistence: int = 3,
+    min_mother_history: int = 3,
+    min_daughter_persistence: int = 5,
     total_frames: int | None = None,
 ) -> list[tuple[int, int, float, float]]:
     """
@@ -724,7 +724,7 @@ def track_volume(
                                 continue
                             d1 = mother_daughters[i]
                             dist_sis = float(np.linalg.norm(d1 - p_t))
-                            if dist_sis < 4.50 or dist_sis > 15.50 or dist_um > 8.54:
+                            if dist_sis < 8.00 or dist_sis > 16.00 or dist_um > 8.54:
                                 continue
                             v_drift = v_prev_np[i]
                             p_comov = p_s + v_drift
@@ -735,7 +735,7 @@ def track_volume(
                             cos_sp = float(np.dot(w1, w2) / max(n1 * n2, 1e-6))
                             mid_off = float(np.linalg.norm(0.5 * (d1 + p_t) - p_comov))
                             sym_rat = abs(n1 - n2) / (n1 + n2 + 1e-6)
-                            if cos_sp > -0.55 or mid_off > 2.20 or sym_rat > 0.45:
+                            if cos_sp > -0.60 or mid_off > 2.40 or sym_rat > 0.25:
                                 continue
                             gi, gj = int(idx_src[i]), int(idx_tgt[j])
                             all_edges.append((gi, gj, float(raw_prob), float(dist_um)))
