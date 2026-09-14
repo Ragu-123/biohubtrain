@@ -747,6 +747,11 @@ def track_volume(
     return pred_graph, latency_sec, peak_vram_mb
 
 
+def evaluate_run(*args, **kwargs):
+    """Compatibility stub for baseline scripts that import evaluate_run."""
+    pass
+
+
 def main():
     parser = argparse.ArgumentParser(description="AnisoTrack3D-Ensemble Production Benchmark Evaluation")
     parser.add_argument(
