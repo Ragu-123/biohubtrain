@@ -57,6 +57,7 @@ class BiohubWindowDataset(Dataset):
         self,
         data_dir: Path,
         volume_names: Optional[List[str]] = None,
+        num_volumes: Optional[int] = None,
         downsample: Tuple[int, int, int] = (1, 4, 4),
         window_size: int = 2,
         max_windows_per_vol: Optional[int] = None,
@@ -67,6 +68,8 @@ class BiohubWindowDataset(Dataset):
 
         if volume_names is None:
             geffs = sorted(list(self.data_dir.glob("*.geff")))
+            if num_volumes is not None:
+                geffs = geffs[:num_volumes]
             volume_names = [g.stem for g in geffs]
 
         self.samples = []

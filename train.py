@@ -56,6 +56,7 @@ def parse_args():
     parser.add_argument("--unet-channels", type=int, default=32, help="UNet output channels")
     parser.add_argument("--downsample", type=str, default="1,4,4", help="Z,Y,X downsample strides")
     parser.add_argument("--max-windows-per-vol", type=int, default=None, help="Limit windows per movie for quick iteration")
+    parser.add_argument("--num-volumes", type=int, default=None, help="Number of volumes to load (default: all)")
     parser.add_argument("--save-dir", type=str, default="checkpoints", help="Directory to save weights")
     return parser.parse_args()
 
@@ -100,6 +101,7 @@ def main():
     # 1. Dataset & DataLoader
     dataset = BiohubWindowDataset(
         data_dir=Path(args.data_dir),
+        num_volumes=args.num_volumes,
         downsample=downsample,
         window_size=2,
         max_windows_per_vol=args.max_windows_per_vol,
