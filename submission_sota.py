@@ -468,12 +468,29 @@ def track_volume_inference(
             speed_prev_t = torch.norm(v_prev_t, dim=-1, keepdim=True)
             cos_theta_gpu = torch.sum(v_prev_t.unsqueeze(1) * diff_gpu, dim=-1) / (speed_prev_t * dist_gpu + 1e-6)
             delta_speed_gpu = torch.abs(dist_gpu - speed_prev_t)
-            momentum_bonus = torch.where(
-                (speed_prev_t > 1e-3) & (dist_gpu > 1e-3),
-                0.08 * cos_theta_gpu - 0.02 * (delta_speed_gpu / 10.0),
+
+            # Advective Kinematic Displacement Prior
+            p_pred_t = p_src_t + v_prev_t
+            diff_advect = p_tgt_t.unsqueeze(0) - p_pred_t.unsqueeze(1)
+            dist_advect = torch.norm(diff_advect, dim=-1)
+
+            # Acute reversal suppression for moving cells (suppress >120-degree hairpin turns)
+            reversal_pen = torch.where(
+                (speed_prev_t > 1.2) & (cos_theta_gpu < -0.20),
+                0.25 * (cos_theta_gpu + 0.20),
                 torch.zeros_like(cos_theta_gpu)
             )
-            scores_gpu = probs_gpu + momentum_bonus
+            momentum_bonus = torch.where(
+                (speed_prev_t > 1e-3) & (dist_gpu > 1e-3),
+                0.10 * cos_theta_gpu - 0.02 * (delta_speed_gpu / 10.0) + reversal_pen,
+                torch.zeros_like(cos_theta_gpu)
+            )
+            advect_bonus = torch.where(
+                speed_prev_t > 0.8,
+                0.05 * torch.exp(-0.5 * (dist_advect / 3.0) ** 2),
+                torch.zeros_like(dist_gpu)
+            )
+            scores_gpu = probs_gpu + momentum_bonus + advect_bonus
 
             cand_mask = (probs_gpu > div_threshold) & (dist_gpu <= 12.0)
             cand_si, cand_tj = torch.nonzero(cand_mask, as_tuple=True)

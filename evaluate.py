@@ -574,12 +574,29 @@ def track_volume(
             speed_prev_t = torch.norm(v_prev_t, dim=-1, keepdim=True)
             cos_theta_gpu = torch.sum(v_prev_t.unsqueeze(1) * diff_gpu, dim=-1) / (speed_prev_t * dist_gpu + 1e-6)
             delta_speed_gpu = torch.abs(dist_gpu - speed_prev_t)
-            momentum_bonus = torch.where(
-                (speed_prev_t > 1e-3) & (dist_gpu > 1e-3),
-                0.08 * cos_theta_gpu - 0.02 * (delta_speed_gpu / 10.0),
+
+            # Advective Kinematic Displacement Prior
+            p_pred_t = p_src_t + v_prev_t
+            diff_advect = p_tgt_t.unsqueeze(0) - p_pred_t.unsqueeze(1)
+            dist_advect = torch.norm(diff_advect, dim=-1)
+
+            # Acute reversal suppression for moving cells (suppress >120-degree hairpin turns)
+            reversal_pen = torch.where(
+                (speed_prev_t > 1.2) & (cos_theta_gpu < -0.20),
+                0.25 * (cos_theta_gpu + 0.20),
                 torch.zeros_like(cos_theta_gpu)
             )
-            scores_gpu = probs_gpu + momentum_bonus
+            momentum_bonus = torch.where(
+                (speed_prev_t > 1e-3) & (dist_gpu > 1e-3),
+                0.10 * cos_theta_gpu - 0.02 * (delta_speed_gpu / 10.0) + reversal_pen,
+                torch.zeros_like(cos_theta_gpu)
+            )
+            advect_bonus = torch.where(
+                speed_prev_t > 0.8,
+                0.05 * torch.exp(-0.5 * (dist_advect / 3.0) ** 2),
+                torch.zeros_like(dist_gpu)
+            )
+            scores_gpu = probs_gpu + momentum_bonus + advect_bonus
 
             cand_mask = (probs_gpu > div_threshold) & (dist_gpu <= 12.0)
             cand_si, cand_tj = torch.nonzero(cand_mask, as_tuple=True)
@@ -708,16 +725,26 @@ def track_volume(
 
 def main():
     parser = argparse.ArgumentParser(description="AnisoTrack3D-Ensemble Production Benchmark Evaluation")
-    parser.add_argument("--data-dir", type=str, required=True, help="Path to train directory with .zarr and .geff")
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default="/kaggle/input/competitions/biohub-cell-tracking-during-development/train",
+        help="Path to train directory with .zarr and .geff",
+    )
     parser.add_argument("--weights", nargs="+", default=[
+        "/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth",
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth",
-        "/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
     ], help="List of model weight paths to ensemble")
-    parser.add_argument("--volumes", nargs="+", default=["6bba_05db0fb1"], help="List of volume names to benchmark")
+    parser.add_argument(
+        "--volumes",
+        nargs="+",
+        default=["44b6_3a861e03", "44b6_12dfb391"],
+        help="List of volume names to benchmark",
+    )
     parser.add_argument("--det-thresh", type=float, default=0.50, help="Detection threshold")
     parser.add_argument("--edge-thresh", type=float, default=0.48, help="Edge threshold")
-    parser.add_argument("--min-length", type=int, default=5, help="Minimum track length filter with internal gap protection")
+    parser.add_argument("--min-length", type=int, default=4, help="Minimum track length filter with internal gap protection")
     parser.add_argument("--det-tta", action="store_true", default=True, help="Use flip-xy TTA for detection")
     parser.add_argument("--max-frames", type=int, default=None, help="Limit frames for fast test")
     args = parser.parse_args()
