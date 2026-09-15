@@ -720,14 +720,22 @@ def main():
     device_0 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     device_1 = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
 
-    weight_candidates = [
-        # Checkpoints from newly trained Bio-DANT run
-        "checkpoints/biodant_best.pth",
-        "checkpoints/biodant_epoch_2.pth",
-        "checkpoints/biodant_epoch_1.pth",
-        "/kaggle/working/biohubtrain/checkpoints/biodant_best.pth",
-        "/kaggle/working/biohubtrain/checkpoints/biodant_epoch_2.pth",
-        "/kaggle/working/biohubtrain/checkpoints/biodant_epoch_1.pth",
+    # Dynamically discover any newly trained Bio-DANT checkpoints from input or working
+    discovered_biodant = []
+    for p_glob in [
+        "/kaggle/input/datasets/ragunathravi/biohubmodel/**/checkpoints/*.pth",
+        "/kaggle/input/biohubmodel/**/checkpoints/*.pth",
+        "/kaggle/working/biohubtrain/checkpoints/*.pth",
+        "checkpoints/*.pth",
+    ]:
+        for f in glob.glob(p_glob, recursive=True):
+            if f not in discovered_biodant:
+                discovered_biodant.append(f)
+
+    # Prioritize biodant_best.pth > epoch_2 > epoch_1
+    discovered_biodant.sort(key=lambda x: (0 if "best" in x else (1 if "epoch_2" in x else 2)))
+
+    weight_candidates = discovered_biodant + [
         # Pre-trained ensemble checkpoints
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth",
