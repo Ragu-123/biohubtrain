@@ -1,393 +1,455 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
-AnisoTrack3D-Ensemble: Production Kaggle Submission Pipeline
-Dual-GPU Offline Inference for Top-10 World-Class Performance (>= 0.970)
-
-Pipeline:
-1. Multi-Checkpoint Consensus Ensemble (Split 0 + Split 1 + Seed 314159)
-2. Custom Triton Continuous 3D Regularized Hessian Sub-Voxel Peak Refiner
-3. Directional Kinematic Momentum Buffer
-4. Bidirectional Harmonic Consensus with Soft-Veto
-5. Astra Internal Gap-Protected Short-Track Pruning (dt = 1 output only)
-6. Consecutive-Frame Endpoint Reconnection (t -> t+1)
-7. Degree-0 Removal & Adaptive Census Multiplier Calibration
-8. Clean Kaggle CSV Export
+=================================================================================
+🏆 CZ BIOHUB CELL TRACKING CHALLENGE — SOTA DUAL-GPU ENSEMBLE SUBMISSION PIPELINE
+=================================================================================
+Hardware: 2x Tesla T4 GPUs (cuda:0 & cuda:1) parallel multiprocessing
+Input Pack: /kaggle/input/notebooks/ragunathravi/forantigravity/biohub-cell-tracking-solution.zip
+Runtime: ~3.8 minutes across all 4 test volumes
+=================================================================================
 """
 
 import os
 import sys
-import glob
+
+# Critical configuration for tracksdata & polars ABI compatibility
+os.environ.setdefault("POLARS_PREFER_PKG", "32")
+
 import time
-import csv
+import zipfile
+import multiprocessing as mp
 from pathlib import Path
 
 import numpy as np
 import polars as pl
+if not hasattr(pl, "Float16"):
+    pl.Float16 = pl.Float32
 import torch
 import torch.nn.functional as F
 import zarr
-import rustworkx as rx
-from tqdm import tqdm
 
-# Ensure offline wheels and repo modules are importable
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-for p in [
-    "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/src",
-    "/kaggle/input/datasets/ragunathravi/forcompbiohub/repo/scripts",
-    "/kaggle/input/forcompbiohub/repo/src",
-    "/kaggle/input/forcompbiohub/repo/scripts",
-]:
-    if p not in sys.path and Path(p).exists():
-        sys.path.insert(0, p)
+# --- 1. RESOLVE & UNPACK SOLUTION PACK ---
+def resolve_solution_pack():
+    zip_candidates = [
+        Path("/kaggle/input/notebooks/ragunathravi/forantigravity/biohub-cell-tracking-solution.zip"),
+        Path("/kaggle/input/forantigravity/biohub-cell-tracking-solution.zip"),
+        Path("/kaggle/input/biohub-cell-tracking-solution/biohub-cell-tracking-solution.zip"),
+        Path("/kaggle/working/biohub-cell-tracking-solution.zip"),
+    ]
+    dir_candidates = [
+        Path("/kaggle/input/datasets/ragunathravi/forcompbiohub"),
+        Path("/kaggle/input/forcompbiohub"),
+        Path("/kaggle/working"),
+        Path("/kaggle/working/support_pack"),
+        Path("/kaggle/input/biohub-tracking-support-pack-50ep-v1"),
+        Path("/kaggle/input/datasets/pilkwang/biohub-tracking-support-pack-50ep-v1"),
+        Path("/tmp/biohub-cell-tracking-solution"),
+        Path("/kaggle/input/notebooks/ragunathravi/forantigravity/biohub-cell-tracking-solution"),
+        Path("/kaggle/input/forantigravity/biohub-cell-tracking-solution"),
+        Path("/kaggle/input/biohub-cell-tracking-solution"),
+        Path("/kaggle/working/biohub-cell-tracking-solution"),
+    ]
 
-import tracksdata as td
-from biohub_tracking.io import open_dataset
-from predict_unet_transformer import load_model, extract_pos_features, pool_kernel_from_um
-from src.models import AnisoTrack3D
-from src.kernels.triton_ops import refine_subvoxel_peaks_triton
-from src.models.local_transformer import log_sinkhorn_uot
-from src.kernels.cpp_ops import get_cpp_tracker
+    # Check direct directories
+    for dc in dir_candidates:
+        if (dc / "weights").exists() and (dc / "repo").exists():
+            return dc
+        # Also check if dc contains repo directly
+        if (dc / "weights").exists() or (dc / "repo").exists():
+            return dc
 
+    # Unpack zip if found
+    for zc in zip_candidates:
+        if zc.exists():
+            extract_dir = Path("/tmp/biohub-cell-tracking-solution")
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Unpacking {zc} -> /tmp ...")
+            with zipfile.ZipFile(zc, "r") as zf:
+                zf.extractall("/tmp")
+            if (extract_dir / "weights").exists() and (extract_dir / "repo").exists():
+                return extract_dir
+            sub = extract_dir / "biohub-cell-tracking-solution"
+            if (sub / "weights").exists() and (sub / "repo").exists():
+                return sub
+            if (Path("/tmp/weights")).exists() and (Path("/tmp/repo")).exists():
+                return Path("/tmp")
+            return extract_dir
 
-def load_any_model(weights_path: Path, device: torch.device):
-    """
-    Universal model loader supporting both newly trained Bio-DANT checkpoints
-    (AnisoTrack3D) and pre-trained split weights (UNetNodeTransformer).
-    """
-    try:
-        sd = torch.load(weights_path, map_location=device, weights_only=False)
-    except TypeError:
-        sd = torch.load(weights_path, map_location=device)
-
-    if isinstance(sd, dict) and ("unet_state_dict" in sd or "transformer_state_dict" in sd):
-        print(f"   -> Detected Bio-DANT checkpoint format for {weights_path.name}")
-        m = AnisoTrack3D(
-            unet_out_channels=32,
-            unet_layers=[32, 64, 128],
-            transformer_d_model=64,
-            depthwise=True,
-        ).to(device)
-        u_sd = sd.get("unet_state_dict", {})
-        t_sd = sd.get("transformer_state_dict", {})
-        m.unet.load_state_dict(u_sd, strict=False)
-        if t_sd:
-            m.transformer.load_state_dict(t_sd, strict=False)
-        m.eval()
-        return m, 2, (1, 4, 4)
-    else:
-        return load_model(weights_path, device)
-
-SUBMISSION_COLUMNS = [
-    "id", "dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"
-]
-
-
-def filter_short_tracks_with_gaps(
-    coords: np.ndarray,
-    edges: list[tuple[int, int, float, float]],
-    min_length: int = 5,
-    scale: tuple[float, ...] = (1.625, 0.40625, 0.40625),
-    max_gap_dist_um: float = 12.0,
-    total_frames: int = 100,
-) -> tuple[np.ndarray, list[tuple[int, int, float, float]]]:
-    if min_length <= 1 or len(edges) == 0:
-        return coords, edges
-
-    N = len(coords)
-    rx_g = rx.PyDiGraph()
-    rx_g.add_nodes_from(range(N))
-    for src, tgt, prob, dist in edges:
-        rx_g.add_edge(src, tgt, None)
-
-    endpoints = [n for n in range(N) if rx_g.out_degree(n) == 0 and rx_g.in_degree(n) > 0]
-    startpoints = [n for n in range(N) if rx_g.in_degree(n) == 0 and rx_g.out_degree(n) > 0]
-    t_coords = coords[:, 0]
-
-    starts_by_t: dict[int, list[int]] = {}
-    for sp in startpoints:
-        t_sp = int(t_coords[sp])
-        starts_by_t.setdefault(t_sp, []).append(sp)
-
-    scale_arr = np.array(scale, dtype=np.float32)
-    coords_um = coords[:, 1:] * scale_arr
-
-    internal_gap_edges = []
-    for ep in endpoints:
-        t_ep = int(t_coords[ep])
-        t_cand = t_ep + 2  # 1-frame dropout (dt = 2)
-        if t_cand in starts_by_t:
-            p_ep = coords_um[ep]
-            for sp in starts_by_t[t_cand]:
-                p_sp = coords_um[sp]
-                d = np.linalg.norm(p_ep - p_sp)
-                if d <= max_gap_dist_um:
-                    internal_gap_edges.append((ep, sp))
-
-    undir_g = rx.PyGraph()
-    undir_g.add_nodes_from(range(N))
-    for src, tgt, prob, dist in edges:
-        undir_g.add_edge(src, tgt, None)
-    for ep, sp in internal_gap_edges:
-        undir_g.add_edge(ep, sp, None)
-
-    comps = rx.connected_components(undir_g)
-    surviving_nodes = set()
-    for comp in comps:
-        comp_frames = set(coords[n, 0] for n in comp)
-        if len(comp_frames) >= min_length or 0 in comp_frames or (total_frames - 1) in comp_frames:
-            surviving_nodes.update(comp)
-
-    new_edges = [(s, t, p, d) for s, t, p, d in edges if s in surviving_nodes and t in surviving_nodes]
-    new_node_ids = sorted(list(surviving_nodes))
-    old_to_new = {old: new for new, old in enumerate(new_node_ids)}
-    filtered_coords = coords[new_node_ids]
-    remapped_edges = [(old_to_new[s], old_to_new[t], p, d) for s, t, p, d in new_edges]
-    return filtered_coords, remapped_edges
-
-
-def prune_false_divisions(
-    coords: np.ndarray,
-    edges: list[tuple[int, int, float, float]],
-    scale: tuple[float, ...],
-    cos_spindle_thresh: float = -0.60,
-    midpoint_thresh: float = 2.40,
-    sym_ratio_thresh: float = 0.25,
-    min_sister_dist_um: float = 8.00,
-    max_sister_dist_um: float = 16.00,
-    min_prob: float = 0.25,
-    min_mother_history: int = 3,
-    min_daughter_persistence: int = 5,
-    total_frames: int | None = None,
-) -> list[tuple[int, int, float, float]]:
-    """
-    Prune spurious second-daughter edges from non-dividing cells that cause division FPs.
-    Enforces Galilean comoving reference frame, sister distance bounds, mother history,
-    and multi-frame daughter lineage persistence.
-    """
-    if not edges:
-        return edges
-
-    rx_g = rx.PyDiGraph()
-    rx_g.add_nodes_from(range(len(coords)))
-    edge_dict = {}
-    for src, tgt, prob, dist in edges:
-        rx_g.add_edge(src, tgt, None)
-        edge_dict[(src, tgt)] = (prob, dist)
-
-    scale_arr = np.array(scale, dtype=np.float32)
-    coords_um = coords[:, 1:] * scale_arr
-
-    edges_to_remove = set()
-    num_forks = 0
-    num_pruned = 0
-
-    for d in range(len(coords)):
-        succs = rx_g.successors(d)
-        if len(succs) < 2:
+    # Fallback search in /kaggle subdirectories (bounded to avoid slow recursive crawl)
+    for base in [Path("/kaggle/input"), Path("/kaggle/working"), Path("/tmp")]:
+        if not base.exists():
             continue
-        num_forks += 1
-        preds = rx_g.predecessors(d)
-        probs = [edge_dict[(d, s)][0] for s in succs]
-
-        # Invariant 1: Mother must have established incoming tracklet history (>= min_mother_history)
-        d_t = int(coords[d, 0])
-        if d_t >= min_mother_history:
-            if len(preds) == 0:
-                weaker_child = succs[int(np.argmin(probs))]
-                edges_to_remove.add((d, weaker_child))
-                num_pruned += 1
-                continue
-
-            curr = d
-            m_hist = 0
-            while True:
-                pr = rx_g.predecessors(curr)
-                if not pr:
-                    break
-                curr = pr[0]
-                m_hist += 1
-                if m_hist >= min_mother_history:
-                    break
-            if m_hist < min_mother_history:
-                weaker_child = succs[int(np.argmin(probs))]
-                edges_to_remove.add((d, weaker_child))
-                num_pruned += 1
-                continue
-
-        # Invariant 2: Candidate edge probability threshold (must satisfy minimum division edge confidence)
-        if min(probs) < min_prob:
-            weaker_child = succs[int(np.argmin(probs))]
-            edges_to_remove.add((d, weaker_child))
-            num_pruned += 1
-            continue
-
-        # Invariant 3: Daughter Lineage Persistence (daughters must survive >= min_daughter_persistence frames after mitosis)
-        d1_t = int(coords[succs[0], 0])
-        def get_fwd_len(node_idx):
-            c = node_idx
-            f_len = 0
-            while True:
-                sc = rx_g.successors(c)
-                if not sc:
-                    break
-                c = sc[0]
-                f_len += 1
-            return f_len
-
-        d1_len = get_fwd_len(succs[0])
-        d2_len = get_fwd_len(succs[1])
-
-        avail_frames = (total_frames - 1 - d1_t) if total_frames is not None else min_daughter_persistence
-        req_pers = max(1, min(min_daughter_persistence, int(avail_frames)))
-
-        if d1_len < req_pers and d2_len >= req_pers:
-            edges_to_remove.add((d, succs[0]))
-            num_pruned += 1
-            continue
-        elif d2_len < req_pers and d1_len >= req_pers:
-            edges_to_remove.add((d, succs[1]))
-            num_pruned += 1
-            continue
-        elif d1_len < req_pers and d2_len < req_pers:
-            weaker_child = succs[int(np.argmin(probs))]
-            edges_to_remove.add((d, weaker_child))
-            num_pruned += 1
-            continue
-
-        # Invariant 4: Galilean Co-Moving Reference Frame Geometric Cleavage Invariants
-        p_m = coords_um[d]
-        if preds:
-            p_pred = coords_um[preds[0]]
-            v_mother = p_m - p_pred
-        else:
-            v_mother = np.zeros(3, dtype=np.float32)
-        p_comoving = p_m + v_mother
-
-        p_d1 = coords_um[succs[0]]
-        p_d2 = coords_um[succs[1]]
-
-        w1 = p_d1 - p_comoving
-        w2 = p_d2 - p_comoving
-        d1 = np.linalg.norm(w1)
-        d2 = np.linalg.norm(w2)
-
-        cos_spindle = float(np.dot(w1, w2) / (d1 * d2 + 1e-6))
-        midpoint_offset = float(np.linalg.norm(p_comoving - 0.5 * (p_d1 + p_d2)))
-        sym_ratio = float(abs(d1 - d2) / (d1 + d2 + 1e-6))
-        dist_sister = float(np.linalg.norm(p_d1 - p_d2))
-
-        if (
-            cos_spindle > cos_spindle_thresh
-            or midpoint_offset > midpoint_thresh
-            or sym_ratio > sym_ratio_thresh
-            or dist_sister < min_sister_dist_um
-            or dist_sister > max_sister_dist_um
-        ):
-            weaker_child = succs[int(np.argmin(probs))]
-            edges_to_remove.add((d, weaker_child))
-            num_pruned += 1
-            continue
-
-    if num_forks > 0:
-        print(f"  [Mitosis Filter] Evaluated {num_forks} candidate forks -> Pruned {num_pruned} spurious forks ({num_forks - num_pruned} valid mitoses retained)")
-
-    return [e for e in edges if (e[0], e[1]) not in edges_to_remove]
-
-
-def reconnect_broken_consecutive_endpoints(
-    coords: np.ndarray,
-    edges: list[tuple[int, int, float, float]],
-    scale: tuple[float, ...],
-    max_reconnect_dist_um: float = 6.5,
-) -> list[tuple[int, int, float, float]]:
-    if not edges:
-        return edges
-
-    N = len(coords)
-    rx_g = rx.PyDiGraph()
-    rx_g.add_nodes_from(range(N))
-    for src, tgt, prob, dist in edges:
-        rx_g.add_edge(src, tgt, None)
-
-    endpoints = [n for n in range(N) if rx_g.out_degree(n) == 0]
-    startpoints = [n for n in range(N) if rx_g.in_degree(n) == 0]
-
-    t_coords = coords[:, 0]
-    starts_by_t: dict[int, list[int]] = {}
-    for sp in startpoints:
-        t_sp = int(t_coords[sp])
-        starts_by_t.setdefault(t_sp, []).append(sp)
-
-    scale_arr = np.array(scale, dtype=np.float32)
-    coords_um = coords[:, 1:] * scale_arr
-
-    new_reconnect_edges = []
-    claimed_starts = set()
-
-    for ep in endpoints:
-        t_ep = int(t_coords[ep])
-        t_next = t_ep + 1
-        if t_next in starts_by_t:
-            p_ep = coords_um[ep]
-            best_sp = None
-            best_d = float("inf")
-            for sp in starts_by_t[t_next]:
-                if sp in claimed_starts:
+        try:
+            for child in base.iterdir():
+                if not child.is_dir() or "competitions" in child.name:
                     continue
-                p_sp = coords_um[sp]
-                d = np.linalg.norm(p_ep - p_sp)
-                if d <= max_reconnect_dist_um and d < best_d:
-                    best_d = d
-                    best_sp = sp
-            if best_sp is not None:
-                new_reconnect_edges.append((ep, best_sp, 0.85, float(best_d)))
-                claimed_starts.add(best_sp)
+                if (child / "weights").exists() and (child / "repo").exists():
+                    return child
+                try:
+                    for sub in child.iterdir():
+                        if sub.is_dir() and (sub / "weights").exists() and (sub / "repo").exists():
+                            return sub
+                except (PermissionError, OSError):
+                    continue
+        except (PermissionError, OSError):
+            continue
 
-    return edges + new_reconnect_edges
+    return Path("/kaggle/working")
+
+SOLUTION_ROOT = resolve_solution_pack()
+print(f"Using Solution Root: {SOLUTION_ROOT}")
+
+# Register repo source paths
+for candidate_root in [
+    Path("/kaggle/input/datasets/ragunathravi/forcompbiohub"),
+    Path("/kaggle/input/forcompbiohub"),
+    SOLUTION_ROOT,
+    Path("/kaggle/working"),
+    Path("/kaggle/working/support_pack"),
+]:
+    for sub in ["repo/src", "repo/scripts", "src", "scripts"]:
+        p = str(candidate_root / sub)
+        if Path(p).exists() and p not in sys.path:
+            sys.path.insert(0, p)
+
+if "/kaggle/working" not in sys.path:
+    sys.path.insert(0, "/kaggle/working")
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import contextlib
+import logging
+# Silence tracksdata Gurobi license check and warning traceback completely
+logging.getLogger("tracksdata").setLevel(logging.ERROR)
+logging.raiseExceptions = False
+
+from biohub_tracking.io import open_dataset
+from predict_unet_transformer import load_model, _load_frame, pool_kernel_from_um, _detect_cells_pooled
+from train_unet_transformer import extract_pos_features, _POS_EMBED_DIM
+import ilpy
+import tracksdata as td
+from tracksdata.solvers import _ilp_solver
+from postprocess_clean import filter_output_graph
+
+# Direct SCIP Solver backend: bypasses Gurobi check and eliminates traceback completely
+def _direct_scip_solve(self):
+    if self._count == 0:
+        raise ValueError("Empty ILPSolver model, there is nothing to solve.")
+    if len(self._edge_vars) == 0:
+        raise ValueError("No edges found in the graph, there is nothing to solve.")
+
+    solver = ilpy.Solver(
+        num_variables=self._count,
+        default_variable_type=ilpy.VariableType.Binary,
+        preference=ilpy.Preference.Scip,
+    )
+    solver.set_num_threads(self.num_threads)
+    solver.set_objective(self._objective)
+    solver.set_constraints(self._constraints)
+    solver.set_optimality_gap(self.gap)
+    if self.timeout is not None:
+        solver.set_timeout(self.timeout)
+    solution = solver.solve()
+    if solution is None:
+        raise RuntimeError("Failed to solve the ILP problem with SCIP solver.")
+    return solution
+
+_ilp_solver.ILPSolver._solve = _direct_scip_solve
 
 
-def prune_isolated_degree_0_nodes(
-    coords: np.ndarray,
-    edges: list[tuple[int, int, float, float]],
-) -> tuple[np.ndarray, list[tuple[int, int, float, float]]]:
-    if not edges:
-        return coords, edges
+import json
+from biohub_tracking.models import TemporalUNet3D
+from train_unet_transformer import UNetNodeTransformer, _POS_EMBED_DIM
+from predict_unet_transformer import _DEFAULT_CONFIG
 
-    nodes_with_edges = set(e[0] for e in edges) | set(e[1] for e in edges)
-    active_node_ids = sorted(list(nodes_with_edges))
-    old_to_new = {old: new for new, old in enumerate(active_node_ids)}
 
-    clean_coords = coords[active_node_ids]
-    clean_edges = [(old_to_new[e[0]], old_to_new[e[1]], e[2], e[3]) for e in edges]
-    return clean_coords, clean_edges
+def load_robust_model(weights_path: Path, device: torch.device):
+    """
+    Robust universal model loader supporting both raw state_dicts (edge_predictor_best.pth)
+    and full training checkpoints with 'model_state_dict' (checkpoint_last.pth).
+    """
+    weights_path = Path(weights_path)
+    config_path = weights_path.parent / "config.json"
+    if not config_path.exists():
+        config_path = weights_path.parent.parent / "config.json"
+    if config_path.exists():
+        config = {**_DEFAULT_CONFIG, **json.loads(config_path.read_text())}
+    else:
+        config = _DEFAULT_CONFIG
+
+    downsample = tuple(config.get("downsample", [1, 4, 4]))
+    unet = TemporalUNet3D(
+        in_channels=1,
+        out_channels=config["unet_out_channels"],
+        layers=config["unet_layers"],
+    )
+    model = UNetNodeTransformer(
+        unet=unet,
+        unet_out_channels=config["unet_out_channels"],
+        pos_feat_dim=4 * _POS_EMBED_DIM,
+    )
+    try:
+        state = torch.load(weights_path, map_location=device, weights_only=False)
+    except TypeError:
+        state = torch.load(weights_path, map_location=device)
+
+    if isinstance(state, dict) and "model_state_dict" in state:
+        state = state["model_state_dict"]
+
+    model.load_state_dict(state)
+    model.to(device)
+    model.eval()
+    return model, config.get("window_size", 2), downsample
+
+
+# Resolve model weights
+def first_file(paths):
+    for p in paths:
+        if Path(p).exists():
+            return Path(p)
+    return Path(paths[0])
+
+PRIMARY_WEIGHTS = first_file([
+    Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth"),
+    Path("/kaggle/input/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth"),
+    SOLUTION_ROOT / "weights/unet_transformer/split_0/edge_predictor_best.pth",
+    Path("/kaggle/working/weights/unet_transformer/split_0/edge_predictor_best.pth"),
+    Path("/kaggle/working/support_pack/weights/unet_transformer/split_0/edge_predictor_best.pth"),
+    Path("/kaggle/input/biohub-tracking-support-pack-50ep-v1/weights/unet_transformer/split_0/edge_predictor_best.pth"),
+    Path("/kaggle/input/datasets/pilkwang/biohub-tracking-support-pack-50ep-v1/weights/unet_transformer/split_0/edge_predictor_best.pth"),
+])
+
+def resolve_seed_weights():
+    candidates = [
+        Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/checkpoint_last.pth"),
+        Path("/kaggle/input/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/checkpoint_last.pth"),
+        Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/checkpoint_last.pth"),
+        Path("/kaggle/input/forcompbiohub/weights/unet_transformer/split_1/checkpoint_last.pth"),
+        Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth"),
+        Path("/kaggle/input/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth"),
+        Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth"),
+        Path("/kaggle/input/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth"),
+        SOLUTION_ROOT / "secondary_seed_weights/unet_transformer/split_0/checkpoint_last.pth",
+        SOLUTION_ROOT / "weights/unet_transformer/split_1/checkpoint_last.pth",
+        SOLUTION_ROOT / "weights/unet_transformer/split_1/edge_predictor_best.pth",
+        Path("/kaggle/working/secondary_seed_weights/unet_transformer/split_0/checkpoint_last.pth"),
+        PRIMARY_WEIGHTS,
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+    for base in [Path("/kaggle/input"), Path("/kaggle/working"), Path("/tmp")]:
+        if not base.exists():
+            continue
+        try:
+            for child in base.iterdir():
+                if not child.is_dir() or "competitions" in child.name:
+                    continue
+                for w in child.glob("**/edge_predictor_best.pth"):
+                    if w.exists() and w != PRIMARY_WEIGHTS:
+                        return w
+        except (PermissionError, OSError):
+            continue
+    return PRIMARY_WEIGHTS
+
+SEED_WEIGHTS = resolve_seed_weights()
+
+def find_test_dir():
+    candidates = [
+        Path("/kaggle/input/competitions/biohub-cell-tracking-during-development/test"),
+        Path("/kaggle/input/biohub-cell-tracking-during-development/test"),
+        Path("/kaggle/working/test"),
+    ]
+    for c in candidates:
+        if c.exists() and len(list(c.glob("*.zarr"))) > 0:
+            return c
+    for base in [Path("/kaggle/input"), Path("/kaggle/working")]:
+        if not base.exists():
+            continue
+        try:
+            for child in base.iterdir():
+                test_sub = child / "test"
+                if test_sub.is_dir() and len(list(test_sub.glob("*.zarr"))) > 0:
+                    return test_sub
+        except (PermissionError, OSError):
+            continue
+    return candidates[0]
+
+TEST_DIR = find_test_dir()
+OUTPUT_CSV = Path("/kaggle/working/submission.csv")
+
+print(f"Primary Weights : {PRIMARY_WEIGHTS} (exists: {PRIMARY_WEIGHTS.exists()})")
+print(f"Seed Weights    : {SEED_WEIGHTS} (exists: {SEED_WEIGHTS.exists()})")
+print(f"Test Directory  : {TEST_DIR} (exists: {TEST_DIR.exists()})")
+
+# Optimal Hyperparameters (Calibrated against Astra Mathematical Audit)
+DET_THRESHOLD        = 0.96875
+POOL_KERNEL_UM       = 3.0
+EDGE_STRONG_THRESH   = 0.40
+EDGE_MIN_THRESH      = 0.20
+EDGE_TOPK_PARENTS    = 3
+EDGE_MAX_DISTANCE_UM = 12.0
+
+ILP_EDGE_WEIGHT      = -1.0
+ILP_APPEAR_WEIGHT    = 0.0
+ILP_DISAPPEAR_WEIGHT = 2.0
+ILP_DIVISION_WEIGHT  = 1.20
+
+
+def detect_and_refine_peaks(prob_map: torch.Tensor, t: int, threshold: float, pool_k: tuple) -> np.ndarray:
+    """
+    3D Continuous Sub-Voxel Peak Detection & Parabolic Fitting.
+    Eliminates centroid quantization lattice errors across anisotropic Z and 4x downsampled XY.
+    """
+    # Normalize tensor shape to exactly (1, 1, Z, Y, X)
+    while prob_map.ndim < 5:
+        prob_map = prob_map.unsqueeze(0)
+    while prob_map.ndim > 5:
+        prob_map = prob_map.squeeze(0)
+
+    pad = tuple(k // 2 for k in pool_k)
+    pooled = F.max_pool3d(prob_map, pool_k, stride=1, padding=pad)
+    is_peak = (prob_map == pooled) & (prob_map > threshold)
+    peak_idx = torch.nonzero(is_peak[0, 0])
+    if peak_idx.shape[0] == 0:
+        return np.empty((0, 4), dtype=np.float32)
+
+    # 3D Continuous Sub-Voxel Parabolic Refinement
+    prob_3d = prob_map[0, 0]
+    prob_pad = F.pad(prob_3d.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1, 1, 1), mode="replicate")[0, 0]
+    pz = peak_idx[:, 0] + 1
+    py = peak_idx[:, 1] + 1
+    px = peak_idx[:, 2] + 1
+    v0 = prob_pad[pz, py, px]
+
+    # X axis
+    vx_m = prob_pad[pz, py, px - 1]
+    vx_p = prob_pad[pz, py, px + 1]
+    denom_x = 2.0 * (vx_m - 2.0 * v0 + vx_p)
+    delta_x = torch.where(denom_x < -1e-6, (vx_m - vx_p) / denom_x, torch.zeros_like(v0))
+    delta_x = torch.clamp(delta_x, -0.5, 0.5)
+
+    # Y axis
+    vy_m = prob_pad[pz, py - 1, px]
+    vy_p = prob_pad[pz, py + 1, px]
+    denom_y = 2.0 * (vy_m - 2.0 * v0 + vy_p)
+    delta_y = torch.where(denom_y < -1e-6, (vy_m - vy_p) / denom_y, torch.zeros_like(v0))
+    delta_y = torch.clamp(delta_y, -0.5, 0.5)
+
+    # Z axis
+    vz_m = prob_pad[pz - 1, py, px]
+    vz_p = prob_pad[pz + 1, py, px]
+    denom_z = 2.0 * (vz_m - 2.0 * v0 + vz_p)
+    delta_z = torch.where(denom_z < -1e-6, (vz_m - vz_p) / denom_z, torch.zeros_like(v0))
+    delta_z = torch.clamp(delta_z, -0.5, 0.5)
+
+    delta = torch.stack([delta_z, delta_y, delta_x], dim=-1)
+    refined = (peak_idx.float() + delta).cpu().numpy()
+    t_col = np.full((len(refined), 1), t, dtype=np.float32)
+    return np.hstack([t_col, refined])
+
+
+def compute_fwd_and_harmonic(
+    model, f_src, f_tgt,
+    p_coords_src_ds, p_coords_tgt_ds,
+    p_pos_src, p_pos_tgt,
+    p_mask_src, p_mask_tgt,
+    w_rev: float = 0.15,
+):
+    """
+    Computes forward and reverse edge logits with distribution moment alignment
+    and asymmetric harmonic mean soft-veto (w_rev=0.15).
+    """
+    fwd_logits = model.predict_edges(
+        f_src, f_tgt,
+        p_coords_src_ds, p_coords_tgt_ds,
+        p_pos_src, p_pos_tgt,
+        p_mask_src, p_mask_tgt,
+    )
+    rev_logits_native = model.predict_edges(
+        f_tgt, f_src,
+        p_coords_tgt_ds, p_coords_src_ds,
+        p_pos_tgt, p_pos_src,
+        p_mask_tgt, p_mask_src,
+    )
+    rev_logits = rev_logits_native.transpose(1, 2)
+
+    # Moment alignment: scale reverse distribution to forward scale
+    fwd_mean, fwd_std = fwd_logits.mean(), fwd_logits.std().clamp_min(1e-4)
+    rev_mean, rev_std = rev_logits.mean(), rev_logits.std().clamp_min(1e-4)
+    rev_aligned = (rev_logits - rev_mean) * (fwd_std / rev_std).clamp(0.5, 2.0) + fwd_mean
+
+    prob_fwd = torch.softmax(fwd_logits[0].float(), dim=0).clamp_min(1e-8)
+    prob_rev = torch.softmax(rev_aligned[0].float(), dim=0).clamp_min(1e-8)
+
+    # Asymmetric harmonic mean
+    p_harm = 1.0 / ((1.0 - w_rev) / prob_fwd + w_rev / prob_rev)
+    p_harm = p_harm / p_harm.sum(dim=0, keepdim=True).clamp_min(1e-8)
+    return p_harm.cpu().numpy()
+
+
+def apply_kinematics(
+    cand_list: list[tuple[int, int, float, float]],
+    coords_dict: dict[int, np.ndarray],
+    predecessor_map: dict[int, int],
+    lambda_v: float = 0.60,
+    sigma_kine: float = 4.5,
+    gamma_align: float = 0.35,
+    beta_kine: float = 0.40,
+):
+    """
+    Modulates candidate edge probabilities using continuous velocity momentum deflection
+    and directional cosine alignment in physical space.
+    """
+    modulated = []
+    for gi, gj, p, dist in cand_list:
+        pos_i = coords_dict[gi]
+        pos_j = coords_dict[gj]
+        disp = pos_j - pos_i
+        disp_norm = float(np.linalg.norm(disp))
+
+        pred_id = predecessor_map.get(gi)
+        if pred_id is not None and pred_id in coords_dict and disp_norm > 1e-4:
+            pos_prev = coords_dict[pred_id]
+            v_prev = pos_i - pos_prev
+            v_norm = float(np.linalg.norm(v_prev))
+            if v_norm > 1e-4:
+                pred_pos = pos_i + lambda_v * v_prev
+                motion_resid = float(np.linalg.norm(pos_j - pred_pos))
+                cos_theta = float(np.dot(disp, v_prev) / (disp_norm * v_norm))
+                cos_factor = ((1.0 + np.clip(cos_theta, -1.0, 1.0)) / 2.0) ** gamma_align
+                kine_mult = float(np.exp(-(motion_resid ** 2) / (2.0 * (sigma_kine ** 2))) * cos_factor)
+            else:
+                kine_mult = 1.0
+        else:
+            kine_mult = 1.0
+
+        p_mod = float(p * ((1.0 - beta_kine) + beta_kine * kine_mult))
+        modulated.append((gi, gj, p_mod, dist))
+    return modulated
 
 
 @torch.no_grad()
-def track_volume_inference(
-    volume_path: Path,
-    models: list[tuple[torch.nn.Module, torch.device]],
-    downsample: tuple[int, int, int] = (1, 4, 4),
-    window_size: int = 2,
-    det_threshold: float = 0.50,
-    edge_threshold: float = 0.48,
-    div_threshold: float = 0.25,
-    div_joint_threshold: float = 0.70,
-    pool_kernel_um: float = 5.0,
-    min_track_length: int = 4,
-) -> tuple[np.ndarray, list[tuple[int, int, float, float]]]:
-    ds = open_dataset(volume_path, normalize=False, load_image=False, downsample=downsample)
-    zarr_arr = zarr.open_group(str(volume_path), mode="r")["0"]
+def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_size: int, downsample: tuple):
+    t0 = time.time()
+    stem = ds_path.stem
+    print(f"[{device}] Starting inference on {stem}...", flush=True)
 
-    q_low = float(ds.quantiles.get("0.001", 100.0))
-    q_high = float(ds.quantiles.get("0.999", 500.0))
+    ds = open_dataset(ds_path, normalize=False, load_image=False, downsample=downsample)
+    zarr_arr = zarr.open_group(str(ds.zarr_path), mode="r")["0"]
+    q_low = float(ds.quantiles["0.001"])
+    q_high = float(ds.quantiles["0.999"])
+    
     T = ds.image_shape[0]
-    target_shape = list(ds.image_shape[1:])
-    scale = tuple(ds.scale)
-    ds_arr = np.array(downsample, dtype=np.float32)
-
-    voxel_size_down = tuple(s * d for s, d in zip(scale, downsample))
-    pool_k = pool_kernel_from_um(pool_kernel_um, voxel_size_down)
-    pad = tuple(k // 2 for k in pool_k)
+    image_shape = (T,) + ds.image_shape[1:]
+    target_shape = list(image_shape[1:])
+    scale = np.array(ds.scale, dtype=np.float32)
+    voxel_size = tuple(s * d for s, d in zip(ds.scale, downsample))
+    raw_voxel_size = np.asarray(voxel_size, dtype=np.float64) / np.asarray(downsample, dtype=np.float64)
+    pool_k = pool_kernel_from_um(POOL_KERNEL_UM, voxel_size)
+    
+    ds_arr_np = np.array(downsample, dtype=np.float32)
+    ds_arr_t = torch.from_numpy(ds_arr_np).to(device)
 
     stride = max(window_size - 1, 1)
     window_starts = list(range(0, T - window_size + 1, stride))
@@ -398,449 +460,341 @@ def track_volume_inference(
 
     seen_frames = set()
     seen_pairs = set()
-    coord_lists_down = []
+    coord_lists = []
     coord_offset = {}
     global_node_count = 0
-    all_edges = []
-    velocity_buffer = {}
+    candidate_edges = []
 
-    primary_device = models[0][1]
-
-    for ws in tqdm(window_starts, desc=f"  Tracking {volume_path.stem}", leave=False, file=sys.stdout):
+    for ws in window_starts:
         frame_indices = list(range(ws, ws + window_size))
-        imgs_raw = []
-        for t in frame_indices:
-            dz, dy, dx = downsample
-            raw = zarr_arr[t, ::dz, ::dy, ::dx].astype(np.float32)
-            f_t = torch.from_numpy(raw)
-            if list(f_t.shape) != target_shape:
-                f_t = F.interpolate(f_t[None, None], size=target_shape, mode="trilinear", align_corners=False)[0, 0]
-            imgs_raw.append(f_t)
+        imgs = torch.stack([_load_frame(zarr_arr, t, target_shape, downsample) for t in frame_indices])
+        imgs = ((imgs - q_low) / (q_high - q_low + 1e-6)).clamp(0.0).unsqueeze(0).to(device)
 
-        imgs_raw = torch.stack(imgs_raw)
-        imgs_raw = ((imgs_raw - q_low) / (q_high - q_low + 1e-6)).clamp(0.0).unsqueeze(0)
+        out0, det0 = m0.encode(imgs)
+        out1, det1 = m1.encode(imgs)
 
-        unet_outs = []
-        det_logits_list = []
-        for m, dev in models:
-            inp = imgs_raw.to(dev)
-            with torch.no_grad():
-                u_out, d_log = m.encode(inp)
-                # TTA flips
-                for dims in [(-1,), (-2,), (-2, -1)]:
-                    inp_f = inp.flip(dims)
-                    _, d_f = m.encode(inp_f)
-                    for f in range(window_size):
-                        d_log[f] = d_log[f] + d_f[f].flip(dims)
-                for f in range(window_size):
-                    d_log[f] = d_log[f] / 4.0
-            unet_outs.append(u_out)
-            det_logits_list.append([dl.to(primary_device) for dl in d_log])
+        # 4-fold Flip-XY TTA
+        for dims in [(-1,), (-2,), (-2, -1)]:
+            imgs_flip = imgs.flip(dims)
+            _, d0_flip = m0.encode(imgs_flip)
+            _, d1_flip = m1.encode(imgs_flip)
+            for f in range(window_size):
+                det0[f] = det0[f] + d0_flip[f].flip(dims)
+                det1[f] = det1[f] + d1_flip[f].flip(dims)
+            del imgs_flip, d0_flip, d1_flip
 
-        det_logits_ens = [
-            sum(det_logits_list[k][f] for k in range(len(models))) / len(models)
-            for f in range(window_size)
-        ]
+        det_fused = [(det0[f] + det1[f]) / 8.0 for f in range(window_size)]
+        del imgs
 
-        # Peak detection & Triton sub-voxel refinement
         for f_idx, t in enumerate(frame_indices):
             if t not in seen_frames:
-                log_t = det_logits_ens[f_idx]
-                pooled = F.max_pool3d(log_t, pool_k, stride=1, padding=pad)
-                sig_t = torch.sigmoid(log_t)
-                is_peak = (log_t == pooled) & (sig_t > det_threshold)
-                peak_idx = torch.nonzero(is_peak[0, 0])
-
-                if len(peak_idx) > 0:
-                    peaks_refined = refine_subvoxel_peaks_triton(log_t[0, 0], peak_idx)
-                    t_col = np.full((len(peaks_refined), 1), t, dtype=np.float32)
-                    arr_down = np.concatenate([t_col, peaks_refined.cpu().numpy()], axis=1)
-                else:
-                    arr_down = np.empty((0, 4), dtype=np.float32)
-
-                coord_offset[t] = (global_node_count, global_node_count + len(arr_down))
-                global_node_count += len(arr_down)
-                coord_lists_down.append(arr_down)
+                arr = detect_and_refine_peaks(det_fused[f_idx][0], t, DET_THRESHOLD, pool_k)
+                coord_offset[t] = (global_node_count, global_node_count + len(arr))
+                global_node_count += len(arr)
+                coord_lists.append(arr)
                 seen_frames.add(t)
 
-        coords_down_so_far = np.concatenate(coord_lists_down) if coord_lists_down else np.empty((0, 4), dtype=np.float32)
+        coords_so_far = np.concatenate(coord_lists) if coord_lists else np.empty((0, 4), dtype=np.float32)
 
-        # Edge association
         for f_idx in range(window_size - 1):
             t_src, t_tgt = frame_indices[f_idx], frame_indices[f_idx + 1]
             if (t_src, t_tgt) in seen_pairs:
                 continue
             seen_pairs.add((t_src, t_tgt))
-
+            if t_src not in coord_offset or t_tgt not in coord_offset:
+                continue
             s_src, e_src = coord_offset[t_src]
             s_tgt, e_tgt = coord_offset[t_tgt]
             if e_src == s_src or e_tgt == s_tgt:
                 continue
 
-            c_src_down = coords_down_so_far[s_src:e_src]
-            c_tgt_down = coords_down_so_far[s_tgt:e_tgt]
-            n_src, n_tgt = len(c_src_down), len(c_tgt_down)
-            idx_src = np.arange(s_src, e_src, dtype=np.int64)
-            idx_tgt = np.arange(s_tgt, e_tgt, dtype=np.int64)
+            c_src = coords_so_far[s_src:e_src]
+            c_tgt = coords_so_far[s_tgt:e_tgt]
+            n_src, n_tgt = len(c_src), len(c_tgt)
 
-            window_shape = (window_size,) + ds.image_shape[1:]
-            c_src_rel = c_src_down.copy()
+            p_coords_src = torch.from_numpy(c_src[:, 1:].astype(np.float32)).unsqueeze(0).to(device)
+            p_coords_tgt = torch.from_numpy(c_tgt[:, 1:].astype(np.float32)).unsqueeze(0).to(device)
+            c_src_rel = c_src.copy()
             c_src_rel[:, 0] = f_idx
-            c_tgt_rel = c_tgt_down.copy()
+            c_tgt_rel = c_tgt.copy()
             c_tgt_rel[:, 0] = f_idx + 1
-            pos_src_np = extract_pos_features(c_src_rel, window_shape)
-            pos_tgt_np = extract_pos_features(c_tgt_rel, window_shape)
+            window_shape = (window_size,) + image_shape[1:]
+            p_pos_src = torch.from_numpy(extract_pos_features(c_src_rel, window_shape)).unsqueeze(0).to(device)
+            p_pos_tgt = torch.from_numpy(extract_pos_features(c_tgt_rel, window_shape)).unsqueeze(0).to(device)
+            p_mask_src = torch.ones(1, n_src, dtype=torch.bool, device=device)
+            p_mask_tgt = torch.ones(1, n_tgt, dtype=torch.bool, device=device)
 
-            edge_logits_models = []
-            for k, (m, dev) in enumerate(models):
-                u_out = unet_outs[k]
-                p_coords_src = torch.from_numpy(c_src_down[:, 1:].astype(np.float32)).unsqueeze(0).to(dev)
-                p_coords_tgt = torch.from_numpy(c_tgt_down[:, 1:].astype(np.float32)).unsqueeze(0).to(dev)
-                p_pos_src = torch.from_numpy(pos_src_np).unsqueeze(0).to(dev)
-                p_pos_tgt = torch.from_numpy(pos_tgt_np).unsqueeze(0).to(dev)
-                p_mask_src = torch.ones(1, n_src, dtype=torch.bool, device=dev)
-                p_mask_tgt = torch.ones(1, n_tgt, dtype=torch.bool, device=dev)
-                ds_arr_t = torch.from_numpy(ds_arr).to(dev)
-
-                with torch.no_grad():
-                    u_feat_src = m._index_features(u_out[:, f_idx], p_coords_src, p_mask_src)
-                    u_feat_tgt = m._index_features(u_out[:, f_idx + 1], p_coords_tgt, p_mask_tgt)
-                    el = m.predict_edges(
-                        u_feat_src, u_feat_tgt,
-                        p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
-                        p_pos_src, p_pos_tgt,
-                        p_mask_src, p_mask_tgt,
-                    )
-                    if isinstance(el, (tuple, list)):
-                        el = el[0]
-                    if el.dim() == 3:
-                        el = el.squeeze(0)
-                    el = el.to(primary_device)
-                edge_logits_models.append(el)
-
-            edge_logits_ens = sum(edge_logits_models) / len(edge_logits_models)
-            if edge_logits_ens.dim() == 3:
-                edge_logits_ens = edge_logits_ens.squeeze(0)
-
-            # Bidirectional Consensus Soft-Veto on GPU
-            probs_gpu = 0.85 * torch.softmax(edge_logits_ens, dim=0) + 0.15 * torch.softmax(edge_logits_ens, dim=1)
-
-            # High-Performance Vectorized Candidate Extraction on GPU (33x faster)
-            scale_t = torch.tensor(scale, dtype=torch.float32, device=primary_device)
-            ds_t = torch.tensor(downsample, dtype=torch.float32, device=primary_device)
-            p_src_t = torch.from_numpy(c_src_down[:, 1:]).to(primary_device) * ds_t * scale_t
-            p_tgt_t = torch.from_numpy(c_tgt_down[:, 1:]).to(primary_device) * ds_t * scale_t
-
-            diff_gpu = p_tgt_t.unsqueeze(0) - p_src_t.unsqueeze(1)
-            dist_gpu = torch.norm(diff_gpu, dim=-1)
-
-            # Directional Momentum Buffer Tensor
-            v_prev_t = torch.zeros((n_src, 3), dtype=torch.float32, device=primary_device)
-            for i in range(n_src):
-                gi = int(idx_src[i])
-                vp = velocity_buffer.get(gi, None)
-                if vp is not None:
-                    v_prev_t[i] = torch.from_numpy(vp).to(primary_device)
-
-            speed_prev_t = torch.norm(v_prev_t, dim=-1, keepdim=True)
-            cos_theta_gpu = torch.sum(v_prev_t.unsqueeze(1) * diff_gpu, dim=-1) / (speed_prev_t * dist_gpu + 1e-6)
-            delta_speed_gpu = torch.abs(dist_gpu - speed_prev_t)
-
-            # Advective Kinematic Displacement Prior
-            p_pred_t = p_src_t + v_prev_t
-            diff_advect = p_tgt_t.unsqueeze(0) - p_pred_t.unsqueeze(1)
-            dist_advect = torch.norm(diff_advect, dim=-1)
-
-            # Acute reversal suppression for moving cells (suppress >120-degree hairpin turns)
-            reversal_pen = torch.where(
-                (speed_prev_t > 1.2) & (cos_theta_gpu < -0.20),
-                0.25 * (cos_theta_gpu + 0.20),
-                torch.zeros_like(cos_theta_gpu)
+            feat0_src = m0._index_features(out0[:, f_idx], p_coords_src, p_mask_src)
+            feat0_tgt = m0._index_features(out0[:, f_idx + 1], p_coords_tgt, p_mask_tgt)
+            p0 = compute_fwd_and_harmonic(
+                m0, feat0_src, feat0_tgt,
+                p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
+                p_pos_src, p_pos_tgt, p_mask_src, p_mask_tgt, w_rev=0.15
             )
-            momentum_bonus = torch.where(
-                (speed_prev_t > 1e-3) & (dist_gpu > 1e-3),
-                0.10 * cos_theta_gpu - 0.02 * (delta_speed_gpu / 10.0) + reversal_pen,
-                torch.zeros_like(cos_theta_gpu)
+
+            feat1_src = m1._index_features(out1[:, f_idx], p_coords_src, p_mask_src)
+            feat1_tgt = m1._index_features(out1[:, f_idx + 1], p_coords_tgt, p_mask_tgt)
+            p1 = compute_fwd_and_harmonic(
+                m1, feat1_src, feat1_tgt,
+                p_coords_src * ds_arr_t, p_coords_tgt * ds_arr_t,
+                p_pos_src, p_pos_tgt, p_mask_src, p_mask_tgt, w_rev=0.15
             )
-            advect_bonus = torch.where(
-                speed_prev_t > 0.8,
-                0.05 * torch.exp(-0.5 * (dist_advect / 3.0) ** 2),
-                torch.zeros_like(dist_gpu)
-            )
-            scores_gpu = probs_gpu + momentum_bonus + advect_bonus
 
-            cand_mask = (probs_gpu > div_threshold) & (dist_gpu <= 12.0)
-            cand_si, cand_tj = torch.nonzero(cand_mask, as_tuple=True)
+            p_ens = 0.50 * p0 + 0.50 * p1
 
-            if len(cand_si) > 0:
-                c_scores = scores_gpu[cand_si, cand_tj]
-                c_probs = probs_gpu[cand_si, cand_tj]
-                c_dists = dist_gpu[cand_si, cand_tj]
+            # Candidate edge generation for ILP
+            cand_pairs = set()
+            strong = np.argwhere(p_ens >= EDGE_STRONG_THRESH)
+            for si, tj in strong:
+                cand_pairs.add((int(si), int(tj)))
+            top_k = min(EDGE_TOPK_PARENTS, n_src)
+            for tj in range(n_tgt):
+                col_p = p_ens[:, tj]
+                top_sources = np.argpartition(col_p, -top_k)[-top_k:] if top_k < n_src else np.arange(n_src)
+                for si in top_sources:
+                    if float(col_p[si]) >= EDGE_MIN_THRESH:
+                        cand_pairs.add((int(si), int(tj)))
 
-                sort_order = torch.argsort(c_scores, descending=True)
-                c_scores = c_scores[sort_order]
-                c_probs = c_probs[sort_order]
-                cand_si = cand_si[sort_order]
-                cand_tj = cand_tj[sort_order]
-                c_dists = c_dists[sort_order]
+            c_src_xyz = c_src[:, 1:].astype(np.float32)
+            c_tgt_xyz = c_tgt[:, 1:].astype(np.float32)
 
-                cpp_mod = get_cpp_tracker()
-                if cpp_mod is not None:
-                    t_src, t_tgt, t_probs, t_dists, t_div = cpp_mod.fast_greedy_track(
-                        c_scores.cpu(), c_probs.cpu(), cand_si.cpu(), cand_tj.cpu(), c_dists.cpu(),
-                        p_src_t.cpu(), p_tgt_t.cpu(), v_prev_t.cpu(),
-                        n_src, n_tgt, edge_threshold, div_threshold, div_joint_threshold
-                    )
-                    out_src_np = t_src.numpy()
-                    out_tgt_np = t_tgt.numpy()
-                    out_probs_np = t_probs.numpy()
-                    out_dists_np = t_dists.numpy()
-                    p_src_np = p_src_t.cpu().numpy()
-                    p_tgt_np = p_tgt_t.cpu().numpy()
+            for si, tj in cand_pairs:
+                dist = float(np.linalg.norm((c_src_xyz[si] - c_tgt_xyz[tj]) * raw_voxel_size))
+                if dist <= EDGE_MAX_DISTANCE_UM:
+                    candidate_edges.append((s_src + si, s_tgt + tj, float(p_ens[si, tj]), dist))
 
-                    for k in range(len(out_src_np)):
-                        si_idx = out_src_np[k]
-                        tj_idx = out_tgt_np[k]
-                        gi = int(idx_src[si_idx])
-                        gj = int(idx_tgt[tj_idx])
-                        all_edges.append((gi, gj, float(out_probs_np[k]), float(out_dists_np[k])))
-                        velocity_buffer[gj] = p_tgt_np[tj_idx] - p_src_np[si_idx]
-                else:
-                    si_np = cand_si.cpu().numpy()
-                    tj_np = cand_tj.cpu().numpy()
-                    eff_score_np = c_scores.cpu().numpy()
-                    raw_prob_np = c_probs.cpu().numpy()
-                    dist_np = c_dists.cpu().numpy()
-                    p_src_np = p_src_t.cpu().numpy()
-                    p_tgt_np = p_tgt_t.cpu().numpy()
-                    v_prev_np = v_prev_t.cpu().numpy()
+        del out0, out1
 
-                    children_count = {}
-                    parents_count = {}
-                    mother_daughters = {}
-                    mother_d1_prob = {}
+    coords_orig = coords_so_far.astype(np.float64)
+    coords_orig[:, 1:] = coords_orig[:, 1:] * ds_arr_np
 
-                    for k in range(len(si_np)):
-                        i, j = int(si_np[k]), int(tj_np[k])
-                        if parents_count.get(j, 0) >= 1:
-                            continue
-                        eff_score = eff_score_np[k]
-                        raw_prob = raw_prob_np[k]
-                        dist_um = dist_np[k]
-                        p_s = p_src_np[i]
-                        p_t = p_tgt_np[j]
-                        n_ch = children_count.get(i, 0)
+    # Apply Kinematic Momentum Prior in physical space
+    coords_phys = {
+        i: coords_orig[i, 1:] * scale
+        for i in range(len(coords_orig))
+    }
+    s_edges = sorted(candidate_edges, key=lambda x: (coords_orig[x[0], 0], -x[2]))
+    pred_map, used = {}, set()
+    for gi, gj, p, d in s_edges:
+        if gj not in used and p >= 0.40:
+            pred_map[gj] = gi
+            used.add(gj)
+    candidate_edges = apply_kinematics(candidate_edges, coords_phys, pred_map)
 
-                        if n_ch == 0:
-                            if eff_score < edge_threshold and raw_prob < edge_threshold:
-                                continue
-                            gi, gj = int(idx_src[i]), int(idx_tgt[j])
-                            all_edges.append((gi, gj, float(raw_prob), float(dist_um)))
-                            children_count[i] = 1
-                            parents_count[j] = 1
-                            mother_daughters[i] = p_t
-                            mother_d1_prob[i] = raw_prob
-                            velocity_buffer[gj] = p_t - p_s
-                        elif n_ch == 1:
-                            if (mother_d1_prob[i] + raw_prob) < div_joint_threshold or raw_prob < div_threshold:
-                                continue
-                            d1 = mother_daughters[i]
-                            dist_sis = float(np.linalg.norm(d1 - p_t))
-                            if dist_sis < 8.00 or dist_sis > 16.00 or dist_um > 8.54:
-                                continue
-                            v_drift = v_prev_np[i]
-                            p_comov = p_s + v_drift
-                            w1 = d1 - p_comov
-                            w2 = p_t - p_comov
-                            n1 = float(np.linalg.norm(w1))
-                            n2 = float(np.linalg.norm(w2))
-                            cos_sp = float(np.dot(w1, w2) / max(n1 * n2, 1e-6))
-                            mid_off = float(np.linalg.norm(0.5 * (d1 + p_t) - p_comov))
-                            sym_rat = abs(n1 - n2) / (n1 + n2 + 1e-6)
-                            if cos_sp > -0.60 or mid_off > 2.40 or sym_rat > 0.25:
-                                continue
-                            gi, gj = int(idx_src[i]), int(idx_tgt[j])
-                            all_edges.append((gi, gj, float(raw_prob), float(dist_um)))
-                            children_count[i] = 2
-                            parents_count[j] = 1
-                            velocity_buffer[gj] = p_t - p_s
+    print(f"[{device}] {stem}: {len(coords_orig)} raw nodes, {len(candidate_edges)} candidate edges. Running global ILP...", flush=True)
 
-    coords_down = np.concatenate(coord_lists_down) if coord_lists_down else np.empty((0, 4), dtype=np.float32)
-    coords_orig = coords_down.copy()
-    coords_orig[:, 1:] *= ds_arr
+    ilp_graph = td.graph.InMemoryGraph()
+    for k in ["z", "y", "x"]:
+        ilp_graph.add_node_attr_key(k, pl.Float64, 0.0)
+    ilp_nids = ilp_graph.bulk_add_nodes([
+        {"t": int(c[0]), "z": float(c[1]), "y": float(c[2]), "x": float(c[3])}
+        for c in coords_orig
+    ])
+    ilp_graph.add_edge_attr_key("edge_prob", pl.Float64, 0.0)
+    ilp_graph.add_edge_attr_key("edge_dist", pl.Float64, 0.0)
+    ilp_graph.bulk_add_edges([
+        {
+            "source_id": ilp_nids[gi],
+            "target_id": ilp_nids[gj],
+            "edge_prob": p,
+            "edge_dist": d,
+        }
+        for gi, gj, p, d in candidate_edges
+    ])
 
-    # Post-processing: Gap-protected pruning, Cytokinesis False Div pruning, Endpoint reconnection, Degree-0 removal
-    coords_clean, edges_clean = filter_short_tracks_with_gaps(
-        coords_orig, all_edges, min_length=min_track_length, scale=scale, total_frames=T
+    t_ilp = time.time()
+    solver = td.solvers.ILPSolver(
+        edge_weight=ILP_EDGE_WEIGHT * td.EdgeAttr("edge_prob"),
+        appearance_weight=ILP_APPEAR_WEIGHT,
+        disappearance_weight=ILP_DISAPPEAR_WEIGHT,
+        division_weight=ILP_DIVISION_WEIGHT,
+        num_threads=2,
     )
-    edges_clean = prune_false_divisions(coords_clean, edges_clean, scale=scale, total_frames=T)
-    edges_clean = reconnect_broken_consecutive_endpoints(coords_clean, edges_clean, scale=scale)
-    coords_final, edges_final = prune_isolated_degree_0_nodes(coords_clean, edges_clean)
+    with contextlib.redirect_stdout(None):
+        solved_graph = solver.solve(ilp_graph)
+    if hasattr(solved_graph, "detach"):
+        solved_graph = solved_graph.detach()
+    print(f"[{device}] {stem}: Global SCIP ILP solved in {time.time() - t_ilp:.1f}s.", flush=True)
 
-    return coords_final, edges_final
+    nodes_by_id = {}
+    for r in solved_graph.node_attrs().iter_rows(named=True):
+        nid = int(r["node_id"])
+        nodes_by_id[nid] = {
+            "node_id": nid,
+            "t": int(r["t"]),
+            "z": float(r["z"]),
+            "y": float(r["y"]),
+            "x": float(r["x"]),
+        }
+    raw_edges = []
+    for r in solved_graph.edge_attrs().iter_rows(named=True):
+        raw_edges.append({
+            "source_id": int(r["source_id"]),
+            "target_id": int(r["target_id"]),
+            "edge_prob": float(r.get("edge_prob", 0.9)),
+            "distance_um": float(r.get("edge_dist", 0.0)),
+        })
+
+    filt_nodes, filt_edges, stats = filter_output_graph(nodes_by_id, raw_edges, dataset=stem)
+    dt = time.time() - t0
+    pruned = len(nodes_by_id) - len(filt_nodes)
+    print(f"[{device}] Finished {stem} in {dt:.1f}s: {len(filt_nodes)} nodes, {len(filt_edges)} edges (pruned {pruned} noisy nodes, recovered {stats.get('gap_closed_single', 0) + stats.get('gap2_recovered', 0)} gap edges).", flush=True)
+    return stem, filt_nodes, filt_edges
 
 
-def main():
-    print("=" * 85)
-    print("      ANISOTRACK3D-ENSEMBLE KAGGLE PRODUCTION SUBMISSION GENERATOR")
-    print("=" * 85)
+def gpu_worker(gpu_id: int, volume_paths: list[Path], return_dict):
+    device = torch.device(f"cuda:{gpu_id}")
+    print(f"Worker for {device} initialized with {len(volume_paths)} volume(s).", flush=True)
 
-    possible_test_dirs = [
-        Path("/kaggle/input/competitions/biohub-cell-tracking-during-development/test"),
-        Path("/kaggle/input/biohub-cell-tracking-during-development/test"),
-    ]
-    possible_train_dirs = [
-        Path("/kaggle/input/competitions/biohub-cell-tracking-during-development/train"),
-        Path("/kaggle/input/biohub-cell-tracking-during-development/train"),
-    ]
+    m0, window_size, downsample = load_robust_model(PRIMARY_WEIGHTS, device)
+    m1, _, _ = load_robust_model(SEED_WEIGHTS, device)
 
-    test_dir = None
-    is_test = True
-    for td in possible_test_dirs:
-        if td.exists():
-            test_dir = td
-            break
+    worker_results = []
+    for vp in volume_paths:
+        res = process_single_volume(vp, device, m0, m1, window_size, downsample)
+        worker_results.append(res)
 
-    if test_dir is None:
-        is_test = False
-        for trd in possible_train_dirs:
-            if trd.exists():
-                test_dir = trd
-                break
+    return_dict[gpu_id] = worker_results
 
-    if test_dir is None:
-        raise FileNotFoundError("Could not find test or train directory on Kaggle!")
 
-    test_volumes = sorted(list(test_dir.glob("*.zarr")))
-    if not is_test:
-        test_volumes = test_volumes[:2]  # run 2 volumes for verification
+def build_submission_dataframe(all_results):
+    print("\nCompiling final submission dataframe...", flush=True)
+    all_results = sorted(all_results, key=lambda x: x[0])
+    dfs = []
+    seen_stems = set()
+    for stem, filt_nodes, filt_edges in all_results:
+        if stem in seen_stems:
+            print(f"Skipping duplicate result for {stem}", flush=True)
+            continue
+        seen_stems.add(stem)
+        node_id_map = {}
+        node_records = []
+        # Sort nodes deterministically by frame time then original ID
+        sorted_nodes = sorted(filt_nodes.items(), key=lambda item: (int(item[1]["t"]), item[0]))
+        for new_id, (old_id, node) in enumerate(sorted_nodes, start=1):
+            node_id_map[old_id] = new_id
+            node_records.append({
+                "dataset": stem,
+                "row_type": "node",
+                "node_id": new_id,
+                "t": int(node["t"]),
+                "z": max(0, int(round(float(node["z"])))),
+                "y": max(0, int(round(float(node["y"])))),
+                "x": max(0, int(round(float(node["x"])))),
+                "source_id": -1,
+                "target_id": -1,
+            })
 
-    print(f"Discovered {len(test_volumes)} volume(s) in {test_dir} (is_test={is_test})")
-
-    device_0 = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    device_1 = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
-
-    # Dynamically discover any newly trained Bio-DANT checkpoints from input or working
-    discovered_biodant = []
-    for p_glob in [
-        "/kaggle/input/datasets/ragunathravi/biohubmodel/**/checkpoints/*.pth",
-        "/kaggle/input/biohubmodel/**/checkpoints/*.pth",
-        "/kaggle/working/biohubtrain/checkpoints/*.pth",
-        "checkpoints/*.pth",
-    ]:
-        for f in glob.glob(p_glob, recursive=True):
-            if f not in discovered_biodant:
-                discovered_biodant.append(f)
-
-    # Prioritize biodant_best.pth > epoch_2 > epoch_1
-    discovered_biodant.sort(key=lambda x: (0 if "best" in x else (1 if "epoch_2" in x else 2)))
-
-    # Prioritize 1 best Bio-DANT checkpoint + diverse split checkpoints for consensus ensemble
-    weight_candidates = (discovered_biodant[:1] if discovered_biodant else []) + [
-        # Pre-trained diverse split checkpoints from forcompbiohub
-        "/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
-        "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth",
-        "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth",
-        "/kaggle/input/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
-        "/kaggle/input/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth",
-        "/kaggle/input/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth",
-    ] + (discovered_biodant[1:] if discovered_biodant else [])
-
-    loaded_models = []
-    loaded_canonical = set()
-    downsample = (1, 4, 4)
-    window_size = 2
-
-    for wp in weight_candidates:
-        p = Path(wp)
-        if p.exists():
-            resolved_p = p.resolve()
-            # De-duplicate identical files or splits
-            split_key = f"{p.parent.parent.name}_{p.parent.name}" if "split" in str(p) else p.name
-            if split_key in loaded_canonical:
-                continue
-            loaded_canonical.add(split_key)
-
-            dev = device_1 if (len(loaded_models) % 2 == 1 and torch.cuda.device_count() > 1) else device_0
-            print(f"Loading Model {len(loaded_models) + 1} on {dev}: {split_key}/{p.name}")
-            m, window_size, downsample = load_any_model(p, dev)
-            loaded_models.append((m, dev))
-            if len(loaded_models) >= 3:
-                break
-
-    out_csv = Path("submission.csv")
-    row_id = 0
-    total_nodes = 0
-    total_edges = 0
-
-    with open(out_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=SUBMISSION_COLUMNS)
-        writer.writeheader()
-
-        for vol_p in tqdm(test_volumes, desc="Overall Submission Progress", file=sys.stdout):
-            dataset_name = vol_p.stem
-            t0 = time.perf_counter()
-            coords, edges = track_volume_inference(
-                volume_path=vol_p,
-                models=loaded_models,
-                downsample=downsample,
-                window_size=window_size,
-                min_track_length=5,
-            )
-            elapsed = time.perf_counter() - t0
-            print(f"[{dataset_name}] Generated {len(coords)} nodes, {len(edges)} edges in {elapsed:.2f}s")
-
-            # Write node rows
-            for n_idx, (t, z, y, x) in enumerate(coords):
-                writer.writerow({
-                    "id": row_id,
-                    "dataset": dataset_name,
-                    "row_type": "node",
-                    "node_id": n_idx,
-                    "t": int(t),
-                    "z": int(round(float(z))),
-                    "y": int(round(float(y))),
-                    "x": int(round(float(x))),
-                    "source_id": -1,
-                    "target_id": -1,
-                })
-                row_id += 1
-
-            # Write edge rows (strictly dt = 1)
-            for src, tgt, prob, dist in edges:
-                writer.writerow({
-                    "id": row_id,
-                    "dataset": dataset_name,
+        edge_records = []
+        for edge in filt_edges:
+            src = node_id_map.get(int(edge["source_id"]))
+            tgt = node_id_map.get(int(edge["target_id"]))
+            if src is not None and tgt is not None:
+                edge_records.append({
+                    "dataset": stem,
                     "row_type": "edge",
                     "node_id": -1,
                     "t": -1,
                     "z": -1,
                     "y": -1,
                     "x": -1,
-                    "source_id": int(src),
-                    "target_id": int(tgt),
+                    "source_id": src,
+                    "target_id": tgt,
                 })
-                row_id += 1
+        # Sort edges deterministically by source then target
+        edge_records = sorted(edge_records, key=lambda e: (e["source_id"], e["target_id"]))
 
-            total_nodes += len(coords)
-            total_edges += len(edges)
+        vol_nodes_df = pl.DataFrame(node_records, schema={
+            "dataset": pl.Utf8, "row_type": pl.Utf8, "node_id": pl.Int64,
+            "t": pl.Int64, "z": pl.Int64, "y": pl.Int64, "x": pl.Int64,
+            "source_id": pl.Int64, "target_id": pl.Int64,
+        })
+        vol_edges_df = pl.DataFrame(edge_records, schema={
+            "dataset": pl.Utf8, "row_type": pl.Utf8, "node_id": pl.Int64,
+            "t": pl.Int64, "z": pl.Int64, "y": pl.Int64, "x": pl.Int64,
+            "source_id": pl.Int64, "target_id": pl.Int64,
+        })
+        dfs.append(pl.concat([vol_nodes_df, vol_edges_df]))
 
-    # If running on Kaggle, also copy directly to /kaggle/working/submission.csv
-    kaggle_working = Path("/kaggle/working")
-    if kaggle_working.exists():
-        import shutil
-        target_root = kaggle_working / "submission.csv"
-        if out_csv.resolve() != target_root.resolve():
-            shutil.copy(out_csv, target_root)
-            print(f"   Synchronized to: {target_root.resolve()}")
+    if not dfs:
+        # Fallback empty dataframe matching schema
+        return pl.DataFrame({
+            "id": pl.Series(dtype=pl.Int64),
+            "dataset": pl.Series(dtype=pl.Utf8),
+            "row_type": pl.Series(dtype=pl.Utf8),
+            "node_id": pl.Series(dtype=pl.Int64),
+            "t": pl.Series(dtype=pl.Int64),
+            "z": pl.Series(dtype=pl.Int64),
+            "y": pl.Series(dtype=pl.Int64),
+            "x": pl.Series(dtype=pl.Int64),
+            "source_id": pl.Series(dtype=pl.Int64),
+            "target_id": pl.Series(dtype=pl.Int64),
+        })
 
-    print("=" * 85)
-    print(f"✅ SUBMISSION COMPLETE: {out_csv.resolve()}")
-    print(f"   Total Rows Written: {row_id} (Nodes: {total_nodes}, Edges: {total_edges})")
-    print(f"   File Size: {out_csv.stat().st_size / (1024 ** 2):.2f} MB")
-    print("=" * 85)
-    sys.stdout.flush()
+    final_df = pl.concat(dfs)
+    final_df = final_df.with_columns(pl.arange(0, final_df.height).alias("id"))
+    final_df = final_df.select(["id", "dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"])
+    return final_df
+
+
+def main():
+    print("=================================================================")
+    print("🚀 LAUNCHING SOTA DUAL-GPU SUBMISSION PIPELINE")
+    print("=================================================================")
+    start_time = time.time()
+
+    all_zarrs = sorted(list(TEST_DIR.glob("*.zarr")))
+    print(f"Found {len(all_zarrs)} test volume(s): {[z.name for z in all_zarrs]}")
+
+    n_gpus = torch.cuda.device_count()
+    print(f"Available GPUs: {n_gpus}")
+
+    if n_gpus >= 2 and len(all_zarrs) >= 2:
+        gpu0_vols = all_zarrs[::2]
+        gpu1_vols = all_zarrs[1::2]
+        print(f"cuda:0 tasks ({len(gpu0_vols)}): {[z.name for z in gpu0_vols]}")
+        print(f"cuda:1 tasks ({len(gpu1_vols)}): {[z.name for z in gpu1_vols]}")
+
+        manager = mp.Manager()
+        return_dict = manager.dict()
+
+        p0 = mp.Process(target=gpu_worker, args=(0, gpu0_vols, return_dict))
+        p1 = mp.Process(target=gpu_worker, args=(1, gpu1_vols, return_dict))
+
+        p0.start()
+        p1.start()
+        p0.join()
+        p1.join()
+
+        if p0.exitcode != 0 or p1.exitcode != 0:
+            raise RuntimeError(f"GPU Worker process failed! Exit codes: GPU0={p0.exitcode}, GPU1={p1.exitcode}")
+
+        all_results = list(return_dict.get(0, [])) + list(return_dict.get(1, []))
+        if len(all_results) != len(all_zarrs):
+            raise RuntimeError(f"Expected {len(all_zarrs)} test volume results, got {len(all_results)}!")
+    else:
+        print("Running on single GPU or single volume...")
+        manager = mp.Manager()
+        return_dict = manager.dict()
+        gpu_worker(0, all_zarrs, return_dict)
+        all_results = list(return_dict.get(0, []))
+        if len(all_results) != len(all_zarrs):
+            raise RuntimeError(f"Expected {len(all_zarrs)} test volume results, got {len(all_results)}!")
+
+    sub_df = build_submission_dataframe(all_results)
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    sub_df.write_csv(OUTPUT_CSV)
+    elapsed = time.time() - start_time
+
+    print("\n=================================================================")
+    print(f"✅ SUBMISSION GENERATED SUCCESSFULLY in {elapsed:.1f}s ({elapsed/60:.2f} mins)!")
+    print(f"Path: {OUTPUT_CSV}")
+    print(f"Total Rows: {sub_df.height:,}")
+    print(f"Summary by row type: {sub_df['row_type'].value_counts().to_dicts()}")
+    print(f"Summary by dataset: {sub_df['dataset'].value_counts().to_dicts()}")
+    print("=================================================================")
 
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main()
