@@ -202,14 +202,14 @@ def load_robust_model(weights_path: Path, device: torch.device):
     return model, config.get("window_size", 2), downsample
 
 
-# Resolve model weights
+# Resolve model weights: True 2-Fold Cross-Validation Ensemble (Split 0 + Split 1)
 def first_file(paths):
     for p in paths:
         if Path(p).exists():
             return Path(p)
     return Path(paths[0])
 
-PRIMARY_WEIGHTS = first_file([
+SPLIT_0_WEIGHTS = first_file([
     Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth"),
     Path("/kaggle/input/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth"),
     SOLUTION_ROOT / "weights/unet_transformer/split_0/edge_predictor_best.pth",
@@ -219,40 +219,18 @@ PRIMARY_WEIGHTS = first_file([
     Path("/kaggle/input/datasets/pilkwang/biohub-tracking-support-pack-50ep-v1/weights/unet_transformer/split_0/edge_predictor_best.pth"),
 ])
 
-def resolve_seed_weights():
-    candidates = [
-        Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/checkpoint_last.pth"),
-        Path("/kaggle/input/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/checkpoint_last.pth"),
-        Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/checkpoint_last.pth"),
-        Path("/kaggle/input/forcompbiohub/weights/unet_transformer/split_1/checkpoint_last.pth"),
-        Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth"),
-        Path("/kaggle/input/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth"),
-        Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth"),
-        Path("/kaggle/input/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth"),
-        SOLUTION_ROOT / "secondary_seed_weights/unet_transformer/split_0/checkpoint_last.pth",
-        SOLUTION_ROOT / "weights/unet_transformer/split_1/checkpoint_last.pth",
-        SOLUTION_ROOT / "weights/unet_transformer/split_1/edge_predictor_best.pth",
-        Path("/kaggle/working/secondary_seed_weights/unet_transformer/split_0/checkpoint_last.pth"),
-        PRIMARY_WEIGHTS,
-    ]
-    for c in candidates:
-        if c.exists():
-            return c
-    for base in [Path("/kaggle/input"), Path("/kaggle/working"), Path("/tmp")]:
-        if not base.exists():
-            continue
-        try:
-            for child in base.iterdir():
-                if not child.is_dir() or "competitions" in child.name:
-                    continue
-                for w in child.glob("**/edge_predictor_best.pth"):
-                    if w.exists() and w != PRIMARY_WEIGHTS:
-                        return w
-        except (PermissionError, OSError):
-            continue
-    return PRIMARY_WEIGHTS
-
-SEED_WEIGHTS = resolve_seed_weights()
+SPLIT_1_WEIGHTS = first_file([
+    Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth"),
+    Path("/kaggle/input/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth"),
+    SOLUTION_ROOT / "weights/unet_transformer/split_1/edge_predictor_best.pth",
+    Path("/kaggle/working/weights/unet_transformer/split_1/edge_predictor_best.pth"),
+    Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/checkpoint_last.pth"),
+    Path("/kaggle/input/forcompbiohub/weights/unet_transformer/split_1/checkpoint_last.pth"),
+    SOLUTION_ROOT / "weights/unet_transformer/split_1/checkpoint_last.pth",
+    Path("/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth"),
+    Path("/kaggle/input/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth"),
+    SPLIT_0_WEIGHTS,
+])
 
 def find_test_dir():
     candidates = [
@@ -278,8 +256,8 @@ def find_test_dir():
 TEST_DIR = find_test_dir()
 OUTPUT_CSV = Path("/kaggle/working/submission.csv")
 
-print(f"Primary Weights : {PRIMARY_WEIGHTS} (exists: {PRIMARY_WEIGHTS.exists()})")
-print(f"Seed Weights    : {SEED_WEIGHTS} (exists: {SEED_WEIGHTS.exists()})")
+print(f"Model 0 (Split 0 / Fold 0): {SPLIT_0_WEIGHTS} (exists: {SPLIT_0_WEIGHTS.exists()})")
+print(f"Model 1 (Split 1 / Fold 1): {SPLIT_1_WEIGHTS} (exists: {SPLIT_1_WEIGHTS.exists()})")
 print(f"Test Directory  : {TEST_DIR} (exists: {TEST_DIR.exists()})")
 
 # Optimal Hyperparameters (Calibrated against Astra Mathematical Audit)
@@ -646,8 +624,8 @@ def gpu_worker(gpu_id: int, volume_paths: list[Path], return_dict):
     device = torch.device(f"cuda:{gpu_id}")
     print(f"Worker for {device} initialized with {len(volume_paths)} volume(s).", flush=True)
 
-    m0, window_size, downsample = load_robust_model(PRIMARY_WEIGHTS, device)
-    m1, _, _ = load_robust_model(SEED_WEIGHTS, device)
+    m0, window_size, downsample = load_robust_model(SPLIT_0_WEIGHTS, device)
+    m1, _, _ = load_robust_model(SPLIT_1_WEIGHTS, device)
 
     worker_results = []
     for vp in volume_paths:
