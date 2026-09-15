@@ -40,7 +40,10 @@ def trilinear_index_features(feat_map: torch.Tensor, coords: torch.Tensor) -> to
         return torch.empty((0, C), device=feat_map.device, dtype=feat_map.dtype)
 
     if HAS_TRITON and feat_map.is_cuda:
-        return trilinear_index_triton(feat_map, coords)
+        try:
+            return trilinear_index_triton(feat_map, coords)
+        except Exception:
+            pass
 
     # PyTorch fallback
     z_n = (coords[:, 0] / max(Z - 1.0, 1.0)) * 2.0 - 1.0

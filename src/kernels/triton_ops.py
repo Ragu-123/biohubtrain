@@ -253,39 +253,50 @@ def trilinear_index_triton(feat_map: torch.Tensor, coords: torch.Tensor) -> torc
     coords:   (N, 3) float32 on CUDA in order (z, y, x)
     Returns:  (N, C) float32 interpolated features.
     """
-    if not HAS_TRITON or not feat_map.is_cuda:
-        # Fallback to PyTorch continuous grid_sample
-        C, Z, Y, X = feat_map.shape
-        N = coords.shape[0]
-        if N == 0:
-            return torch.empty((0, C), device=feat_map.device)
-        z_n = (coords[:, 0] / (Z - 1.0)) * 2.0 - 1.0
-        y_n = (coords[:, 1] / (Y - 1.0)) * 2.0 - 1.0
-        x_n = (coords[:, 2] / (X - 1.0)) * 2.0 - 1.0
-        grid = torch.stack([x_n, y_n, z_n], dim=-1).view(1, 1, 1, N, 3)
-        sampled = torch.nn.functional.grid_sample(
-            feat_map.unsqueeze(0), grid, mode="bilinear", padding_mode="border", align_corners=False
-        )
-        return sampled.squeeze(0).squeeze(1).squeeze(1).t()
+    if feat_map.dim() == 5:
+        feat_map = feat_map.squeeze(0)
+    if coords.dim() == 3:
+        coords = coords.squeeze(0)
 
     C, Z, Y, X = feat_map.shape
     N = coords.shape[0]
     if N == 0:
         return torch.empty((0, C), device=feat_map.device, dtype=feat_map.dtype)
 
-    out = torch.empty((N, C), device=feat_map.device, dtype=feat_map.dtype)
-    grid = (N,)
-    BLOCK_C = min(32, triton.next_power_of_2(C))
+    def _fallback():
+        c_dev = coords.to(feat_map.device, dtype=torch.float32)
+        z_n = (c_dev[:, 0] / max(Z - 1.0, 1.0)) * 2.0 - 1.0
+        y_n = (c_dev[:, 1] / max(Y - 1.0, 1.0)) * 2.0 - 1.0
+        x_n = (c_dev[:, 2] / max(X - 1.0, 1.0)) * 2.0 - 1.0
+        grid = torch.stack([x_n, y_n, z_n], dim=-1).view(1, 1, 1, N, 3)
+        sampled = torch.nn.functional.grid_sample(
+            feat_map.unsqueeze(0), grid, mode="bilinear", padding_mode="border", align_corners=False
+        )
+        return sampled.squeeze(0).squeeze(1).squeeze(1).t()
 
-    _trilinear_feature_kernel[grid](
-        feat_map, coords, out,
-        C, Z, Y, X,
-        feat_map.stride(0), feat_map.stride(1), feat_map.stride(2), feat_map.stride(3),
-        coords.stride(0), coords.stride(1),
-        out.stride(0), out.stride(1),
-        BLOCK_C=BLOCK_C,
-    )
-    return out
+    if not HAS_TRITON or not feat_map.is_cuda:
+        return _fallback()
+
+    try:
+        device = feat_map.device
+        feat_map_c = feat_map.contiguous()
+        coords_c = coords.to(device, dtype=torch.float32).contiguous()
+        out = torch.empty((N, C), device=device, dtype=feat_map.dtype)
+        grid = (N,)
+        BLOCK_C = min(32, triton.next_power_of_2(C))
+
+        with torch.cuda.device(device):
+            _trilinear_feature_kernel[grid](
+                feat_map_c, coords_c, out,
+                C, Z, Y, X,
+                feat_map_c.stride(0), feat_map_c.stride(1), feat_map_c.stride(2), feat_map_c.stride(3),
+                coords_c.stride(0), coords_c.stride(1),
+                out.stride(0), out.stride(1),
+                BLOCK_C=BLOCK_C,
+            )
+        return out
+    except Exception:
+        return _fallback()
 
 
 def refine_subvoxel_peaks_triton(prob_map: torch.Tensor, int_peaks: torch.Tensor) -> torch.Tensor:
@@ -376,15 +387,90 @@ def refine_subvoxel_peaks_triton(prob_map: torch.Tensor, int_peaks: torch.Tensor
         coords_cont[:, 2] += dx
         return coords_cont
 
-    Z, Y, X = prob_map.shape
-    out_sub = torch.empty((N, 3), device=prob_map.device, dtype=torch.float32)
-    grid = (N,)
+    try:
+        device = prob_map.device
+        prob_map_c = prob_map.contiguous()
+        int_peaks_c = int_peaks.to(device, dtype=torch.int32).contiguous()
+        Z, Y, X = prob_map_c.shape
+        out_sub = torch.empty((N, 3), device=device, dtype=torch.float32)
+        grid = (N,)
 
-    _hessian_subvoxel_kernel[grid](
-        prob_map, int_peaks, out_sub,
-        Z, Y, X,
-        prob_map.stride(0), prob_map.stride(1), prob_map.stride(2),
-        int_peaks.stride(0), int_peaks.stride(1),
-        out_sub.stride(0), out_sub.stride(1),
-    )
-    return out_sub
+        with torch.cuda.device(device):
+            _hessian_subvoxel_kernel[grid](
+                prob_map_c, int_peaks_c, out_sub,
+                Z, Y, X,
+                prob_map_c.stride(0), prob_map_c.stride(1), prob_map_c.stride(2),
+                int_peaks_c.stride(0), int_peaks_c.stride(1),
+                out_sub.stride(0), out_sub.stride(1),
+            )
+        return out_sub
+    except Exception:
+        # Fallback to PyTorch Hessian
+        Z, Y, X = prob_map.shape
+        z0 = int_peaks[:, 0].clamp(1, Z - 2).long()
+        y0 = int_peaks[:, 1].clamp(1, Y - 2).long()
+        x0 = int_peaks[:, 2].clamp(1, X - 2).long()
+
+        p000 = prob_map[z0, y0, x0]
+        p_p00 = prob_map[z0 + 1, y0, x0]
+        p_m00 = prob_map[z0 - 1, y0, x0]
+        p_0p0 = prob_map[z0, y0 + 1, x0]
+        p_0m0 = prob_map[z0, y0 - 1, x0]
+        p_00p = prob_map[z0, y0, x0 + 1]
+        p_00m = prob_map[z0, y0, x0 - 1]
+
+        p_pp0 = prob_map[z0 + 1, y0 + 1, x0]
+        p_pm0 = prob_map[z0 + 1, y0 - 1, x0]
+        p_mp0 = prob_map[z0 - 1, y0 + 1, x0]
+        p_mm0 = prob_map[z0 - 1, y0 - 1, x0]
+
+        p_p0p = prob_map[z0 + 1, y0, x0 + 1]
+        p_p0m = prob_map[z0 + 1, y0, x0 - 1]
+        p_m0p = prob_map[z0 - 1, y0, x0 + 1]
+        p_m0m = prob_map[z0 - 1, y0, x0 - 1]
+
+        p_0pp = prob_map[z0, y0 + 1, x0 + 1]
+        p_0pm = prob_map[z0, y0 + 1, x0 - 1]
+        p_0mp = prob_map[z0, y0 - 1, x0 + 1]
+        p_0mm = prob_map[z0, y0 - 1, x0 - 1]
+
+        gz = 0.5 * (p_p00 - p_m00)
+        gy = 0.5 * (p_0p0 - p_0m0)
+        gx = 0.5 * (p_00p - p_00m)
+
+        Hzz = p_p00 - 2.0 * p000 + p_m00
+        Hyy = p_0p0 - 2.0 * p000 + p_0m0
+        Hxx = p_00p - 2.0 * p000 + p_00m
+
+        Hzy = 0.25 * (p_pp0 - p_pm0 - p_mp0 + p_mm0)
+        Hzx = 0.25 * (p_p0p - p_p0m - p_m0p + p_m0m)
+        Hyx = 0.25 * (p_0pp - p_0pm - p_0mp + p_0mm)
+
+        lam = 1.0
+        a, b, c = lam - Hzz, -Hzy, -Hzx
+        d, e = lam - Hyy, -Hyx
+        f = lam - Hxx
+
+        detA = a * (d * f - e * e) - b * (b * f - e * c) + c * (b * e - d * c)
+        safe_mask = detA > 1e-6
+
+        inv_det = torch.where(safe_mask, 1.0 / detA.clamp(min=1e-6), torch.zeros_like(detA))
+        adj00 = d * f - e * e
+        adj01 = c * e - b * f
+        adj02 = b * e - c * d
+        adj10 = c * e - b * f
+        adj11 = a * f - c * c
+        adj12 = b * c - a * e
+        adj20 = b * e - c * d
+        adj21 = b * c - a * e
+        adj22 = a * d - b * b
+
+        dz = (inv_det * (adj00 * gz + adj01 * gy + adj02 * gx)).clamp(-0.5, 0.5)
+        dy = (inv_det * (adj10 * gz + adj11 * gy + adj12 * gx)).clamp(-0.5, 0.5)
+        dx = (inv_det * (adj20 * gz + adj21 * gy + adj22 * gx)).clamp(-0.5, 0.5)
+
+        coords_cont = int_peaks.float().clone()
+        coords_cont[:, 0] += dz
+        coords_cont[:, 1] += dy
+        coords_cont[:, 2] += dx
+        return coords_cont

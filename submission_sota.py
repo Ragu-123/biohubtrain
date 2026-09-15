@@ -735,15 +735,16 @@ def main():
     # Prioritize biodant_best.pth > epoch_2 > epoch_1
     discovered_biodant.sort(key=lambda x: (0 if "best" in x else (1 if "epoch_2" in x else 2)))
 
-    weight_candidates = discovered_biodant + [
-        # Pre-trained ensemble checkpoints
+    # Prioritize 1 best Bio-DANT checkpoint + diverse split checkpoints for consensus ensemble
+    weight_candidates = (discovered_biodant[:1] if discovered_biodant else []) + [
+        # Pre-trained diverse split checkpoints from forcompbiohub
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth",
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth",
         "/kaggle/input/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
         "/kaggle/input/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth",
         "/kaggle/input/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth",
-    ]
+    ] + (discovered_biodant[1:] if discovered_biodant else [])
 
     loaded_models = []
     loaded_canonical = set()
