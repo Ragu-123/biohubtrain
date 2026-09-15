@@ -43,9 +43,39 @@ for p in [
 import tracksdata as td
 from biohub_tracking.io import open_dataset
 from predict_unet_transformer import load_model, extract_pos_features, pool_kernel_from_um
+from src.models import AnisoTrack3D
 from src.kernels.triton_ops import refine_subvoxel_peaks_triton
 from src.models.local_transformer import log_sinkhorn_uot
 from src.kernels.cpp_ops import get_cpp_tracker
+
+
+def load_any_model(weights_path: Path, device: torch.device):
+    """
+    Universal model loader supporting both newly trained Bio-DANT checkpoints
+    (AnisoTrack3D) and pre-trained split weights (UNetNodeTransformer).
+    """
+    try:
+        sd = torch.load(weights_path, map_location=device, weights_only=False)
+    except TypeError:
+        sd = torch.load(weights_path, map_location=device)
+
+    if isinstance(sd, dict) and ("unet_state_dict" in sd or "transformer_state_dict" in sd):
+        print(f"   -> Detected Bio-DANT checkpoint format for {weights_path.name}")
+        m = AnisoTrack3D(
+            unet_out_channels=32,
+            unet_layers=[32, 64, 128],
+            transformer_d_model=64,
+            depthwise=True,
+        ).to(device)
+        u_sd = sd.get("unet_state_dict", {})
+        t_sd = sd.get("transformer_state_dict", {})
+        m.unet.load_state_dict(u_sd, strict=False)
+        if t_sd:
+            m.transformer.load_state_dict(t_sd, strict=False)
+        m.eval()
+        return m, 2, (1, 4, 4)
+    else:
+        return load_model(weights_path, device)
 
 SUBMISSION_COLUMNS = [
     "id", "dataset", "row_type", "node_id", "t", "z", "y", "x", "source_id", "target_id"
@@ -691,6 +721,14 @@ def main():
     device_1 = torch.device("cuda:1" if torch.cuda.device_count() > 1 else "cuda:0")
 
     weight_candidates = [
+        # Checkpoints from newly trained Bio-DANT run
+        "checkpoints/biodant_best.pth",
+        "checkpoints/biodant_epoch_2.pth",
+        "checkpoints/biodant_epoch_1.pth",
+        "/kaggle/working/biohubtrain/checkpoints/biodant_best.pth",
+        "/kaggle/working/biohubtrain/checkpoints/biodant_epoch_2.pth",
+        "/kaggle/working/biohubtrain/checkpoints/biodant_epoch_1.pth",
+        # Pre-trained ensemble checkpoints
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/secondary_seed_weights/unet_transformer/split_0/edge_predictor_best.pth",
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_0/edge_predictor_best.pth",
         "/kaggle/input/datasets/ragunathravi/forcompbiohub/weights/unet_transformer/split_1/edge_predictor_best.pth",
@@ -709,14 +747,14 @@ def main():
         if p.exists():
             resolved_p = p.resolve()
             # De-duplicate identical files or splits
-            split_key = f"{p.parent.parent.name}_{p.parent.name}"
+            split_key = f"{p.parent.parent.name}_{p.parent.name}" if "split" in str(p) else p.name
             if split_key in loaded_canonical:
                 continue
             loaded_canonical.add(split_key)
 
             dev = device_1 if (len(loaded_models) % 2 == 1 and torch.cuda.device_count() > 1) else device_0
             print(f"Loading Model {len(loaded_models) + 1} on {dev}: {split_key}/{p.name}")
-            m, window_size, downsample = load_model(p, dev)
+            m, window_size, downsample = load_any_model(p, dev)
             loaded_models.append((m, dev))
             if len(loaded_models) >= 3:
                 break
