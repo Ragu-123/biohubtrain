@@ -11,6 +11,7 @@ Runtime: ~3.8 minutes across all 4 test volumes
 
 import os
 import sys
+import json
 
 # Critical configuration for tracksdata & polars ABI compatibility
 os.environ.setdefault("POLARS_PREFER_PKG", "32")
@@ -133,7 +134,8 @@ try:
     import ilpy
     import tracksdata as td
     from tracksdata.solvers import _ilp_solver
-    from postprocess_clean import filter_output_graph
+    from postprocess_clean import filter_output_graph, DensityClassifier, VOXEL_SCALE_UM
+    from duplicate_parent_solver import DuplicateParentTrackingSolver
 
     # Direct SCIP Solver backend: bypasses Gurobi check and eliminates traceback completely
     def _direct_scip_solve(self):
@@ -754,61 +756,81 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
             used.add(gj)
     candidate_edges = apply_kinematics(candidate_edges, coords_phys, pred_map)
 
-    print(f"[{device}] {stem}: {len(coords_orig)} raw nodes, {len(candidate_edges)} candidate edges. Running global ILP...", flush=True)
+    print(f"[{device}] {stem}: {len(coords_orig)} raw nodes, {len(candidate_edges)} candidate edges. Running DuplicateParentTrackingSolver...", flush=True)
 
-    ilp_graph = td.graph.InMemoryGraph()
-    for k in ["z", "y", "x"]:
-        ilp_graph.add_node_attr_key(k, pl.Float64, 0.0)
-    ilp_nids = ilp_graph.bulk_add_nodes([
-        {"t": int(c[0]), "z": float(c[1]), "y": float(c[2]), "x": float(c[3])}
-        for c in coords_orig
-    ])
-    ilp_graph.add_edge_attr_key("edge_prob", pl.Float64, 0.0)
-    ilp_graph.add_edge_attr_key("edge_dist", pl.Float64, 0.0)
-    ilp_graph.bulk_add_edges([
-        {
-            "source_id": ilp_nids[gi],
-            "target_id": ilp_nids[gj],
-            "edge_prob": p,
-            "edge_dist": d,
-        }
-        for gi, gj, p, d in candidate_edges
-    ])
+    t_solver = time.time()
+    total_frames = max((int(c[0]) for c in coords_orig), default=0) + 1 if len(coords_orig) else 100
+    mean_density = len(coords_orig) / max(total_frames, 1)
+    c_div = DensityClassifier.get_calibrated_division_cost(mean_density)
 
-    t_ilp = time.time()
-    solver = td.solvers.ILPSolver(
-        edge_weight=ILP_EDGE_WEIGHT * td.EdgeAttr("edge_prob"),
-        appearance_weight=ILP_APPEAR_WEIGHT,
-        disappearance_weight=ILP_DISAPPEAR_WEIGHT,
-        division_weight=ILP_DIVISION_WEIGHT,
-        num_threads=2,
+    v_scale = tuple(float(s) for s in scale) if hasattr(scale, "__iter__") else VOXEL_SCALE_UM
+    solver = DuplicateParentTrackingSolver(
+        c_app=0.10,
+        c_div=c_div,
+        min_sister_dist_um=3.0,
+        max_sister_dist_um=18.0,
+        max_parent_dist_um=10.0,
+        r_max_um=25.0,
+        voxel_scale=v_scale,
     )
-    with contextlib.redirect_stdout(None):
-        solved_graph = solver.solve(ilp_graph)
-    if hasattr(solved_graph, "detach"):
-        solved_graph = solved_graph.detach()
-    print(f"[{device}] {stem}: Global SCIP ILP solved in {time.time() - t_ilp:.1f}s.", flush=True)
 
-    nodes_by_id = {}
-    for r in solved_graph.node_attrs().iter_rows(named=True):
-        nid = int(r["node_id"])
-        nodes_by_id[nid] = {
-            "node_id": nid,
-            "t": int(r["t"]),
-            "z": float(r["z"]),
-            "y": float(r["y"]),
-            "x": float(r["x"]),
-        }
+    frame_node_indices: dict[int, list[int]] = {}
+    for nid, c in enumerate(coords_orig):
+        frame_node_indices.setdefault(int(c[0]), []).append(nid)
+
+    edges_by_transition: dict[tuple[int, int], list[tuple[int, int, float, float]]] = {}
+    for gi, gj, p, d in candidate_edges:
+        t_src = int(coords_orig[gi, 0])
+        t_tgt = int(coords_orig[gj, 0])
+        edges_by_transition.setdefault((t_src, t_tgt), []).append((gi, gj, p, d))
+
     raw_edges = []
-    for r in solved_graph.edge_attrs().iter_rows(named=True):
-        raw_edges.append({
-            "source_id": int(r["source_id"]),
-            "target_id": int(r["target_id"]),
-            "edge_prob": float(r.get("edge_prob", 0.9)),
-            "distance_um": float(r.get("edge_dist", 0.0)),
-        })
+    for (t_src, t_tgt), c_edges in sorted(edges_by_transition.items(), key=lambda x: x[0]):
+        src_nids = frame_node_indices.get(t_src, [])
+        tgt_nids = frame_node_indices.get(t_tgt, [])
+        if not src_nids or not tgt_nids:
+            continue
 
-    filt_nodes, filt_edges, stats = filter_output_graph(nodes_by_id, raw_edges, dataset=stem)
+        src_vox = coords_orig[src_nids, 1:4]
+        tgt_vox = coords_orig[tgt_nids, 1:4]
+
+        src_idx_map = {nid: idx for idx, nid in enumerate(src_nids)}
+        tgt_idx_map = {nid: idx for idx, nid in enumerate(tgt_nids)}
+
+        prob_mat = np.zeros((len(src_nids), len(tgt_nids)), dtype=np.float64)
+        for gi, gj, p, d in c_edges:
+            if gi in src_idx_map and gj in tgt_idx_map:
+                si = src_idx_map[gi]
+                tj = tgt_idx_map[gj]
+                prob_mat[si, tj] = max(prob_mat[si, tj], float(p))
+
+        solved = solver.solve_frame_pair(src_vox, tgt_vox, prob_mat)
+        for e in solved:
+            raw_edges.append({
+                "source_id": src_nids[e.source_idx],
+                "target_id": tgt_nids[e.target_idx],
+                "edge_prob": float(e.prob),
+                "distance_um": float(e.distance_um),
+                "is_division": int(e.is_division),
+            })
+
+    print(f"[{device}] {stem}: DuplicateParentTrackingSolver solved in {time.time() - t_solver:.2f}s ({len(raw_edges)} edges).", flush=True)
+
+    nodes_by_id = {
+        nid: {
+            "node_id": nid,
+            "t": int(c[0]),
+            "z": float(c[1]),
+            "y": float(c[2]),
+            "x": float(c[3]),
+        }
+        for nid, c in enumerate(coords_orig)
+    }
+
+    filt_nodes, filt_edges, stats = filter_output_graph(
+        nodes_by_id, raw_edges, dataset=stem,
+        mean_nodes_per_frame=mean_density, total_frames=total_frames,
+    )
     dt = time.time() - t0
     pruned = len(nodes_by_id) - len(filt_nodes)
     print(f"[{device}] Finished {stem} in {dt:.1f}s: {len(filt_nodes)} nodes, {len(filt_edges)} edges (pruned {pruned} noisy nodes, recovered {stats.get('gap_closed_single', 0) + stats.get('gap2_recovered', 0)} gap edges).", flush=True)
