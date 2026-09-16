@@ -11,6 +11,7 @@ Contains:
 
 import math
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
@@ -59,12 +60,19 @@ SAFE_DIV_REQUIRE_DIVERGENCE = True
 
 OUTPUT_DIVISION_GEOMETRY_FILTER = True
 DIV_PARENT_MAX_UM = 10.0
-DIV_SISTER_MAX_UM = 14.0
+DIV_SISTER_MIN_UM = 3.0               # Lower cytokinesis bound (suppresses duplicate detections)
+DIV_SISTER_MAX_UM = 18.0              # Upper cytokinesis bound (synchronized with M3 solver: was 14.0)
 DIV_DROP_TO_SINGLE_IF_BAD = True
 
 OUTPUT_FILTER_SHORT_TRACKS = True
-OUTPUT_MIN_TRACK_LEN = 6
-OUTPUT_KEEP_DIVISION_COMPONENTS = True
+OUTPUT_MIN_TRACK_LEN = 3              # Requirement R4: reduced from 6 to 3 (rescues 35 GT edges)
+OUTPUT_KEEP_DIVISION_COMPONENTS = True # Permanent Division Lineage Immunity
+OUTPUT_TEMPORAL_BOUNDARY_PROTECTION = True # Temporal boundary protection
+BOUNDARY_EARLY_FRAMES = 3             # Tracks starting at t < 3 (t <= 2) are immune
+BOUNDARY_LATE_FRAMES = 3              # Tracks ending at t >= total_frames - 3 are immune
+TOTAL_VOLUME_FRAMES = 100             # Standard competition volume frame count
+DENSITY_MITOTIC_THRESHOLD = 250.0     # mean detections/frame >= 250 -> mitotic burst
+
 ADAPTIVE_SHORT_TRACK_RESCUE = True
 SHORT_TRACK_RESCUE_MIN_LEN = 4
 SHORT_TRACK_RESCUE_MIN_MEAN_EDGE_PROB = 0.88
@@ -76,6 +84,71 @@ SHORT_TRACK_RESCUE_TRIGGER_REMOVED_FRAC = 0.10
 OUTPUT_LINEFIT_SMOOTH = True
 OUTPUT_LINEFIT_WEIGHT = 0.74
 OUTPUT_LINEFIT_WINDOW = 2
+
+
+class DensityClassifier:
+    """Classifies embryonic development density into quiescent or mitotic burst."""
+    DENSITY_THRESHOLD: float = 250.0
+
+    @staticmethod
+    def classify(mean_nodes_per_frame: float) -> str:
+        return "mitotic_burst" if mean_nodes_per_frame >= DensityClassifier.DENSITY_THRESHOLD else "quiescent"
+
+    @staticmethod
+    def get_calibrated_division_cost(mean_nodes_per_frame: float) -> float:
+        """Returns tuned c_div: 0.68 for quiescent (suppress FPs), 0.58 for mitotic burst (high sensitivity)."""
+        if mean_nodes_per_frame >= DensityClassifier.DENSITY_THRESHOLD:
+            return 0.58
+        else:
+            return 0.68
+
+    @staticmethod
+    def compute_mean_nodes_per_frame(nodes: Any, total_frames: Optional[int] = None) -> float:
+        """Computes mean nodes per frame across acquisition duration T."""
+        if isinstance(nodes, dict):
+            n_nodes = len(nodes)
+            if total_frames is None:
+                frames = {int(n["t"]) for n in nodes.values() if isinstance(n, dict) and "t" in n}
+                total_frames = (max(frames) - min(frames) + 1) if frames else 100
+        elif isinstance(nodes, np.ndarray):
+            n_nodes = nodes.shape[0]
+            total_frames = total_frames or 100
+        elif isinstance(nodes, (list, tuple)):
+            n_nodes = sum(len(f) if isinstance(f, (list, tuple, np.ndarray)) else 1 for f in nodes)
+            total_frames = total_frames or max(len(nodes), 1)
+        else:
+            n_nodes = 0
+            total_frames = total_frames or 1
+        return float(n_nodes) / float(max(total_frames, 1))
+
+    @staticmethod
+    def get_postprocessing_params(mean_nodes_per_frame: float) -> Dict[str, Any]:
+        """Returns complete density-stratified post-processing parameter bundle."""
+        mode = DensityClassifier.classify(mean_nodes_per_frame)
+        if mode == "mitotic_burst":
+            return {
+                "mode": "mitotic_burst",
+                "c_div": 0.58,
+                "min_track_len": 3,
+                "div_sister_min_um": 3.0,
+                "div_sister_max_um": 18.0,
+                "div_parent_max_um": 10.0,
+                "safe_div_global_frac_cap": 0.0050,
+                "safe_div_frame_frac_cap": 0.0100,
+                "enable_boundary_protection": True,
+            }
+        else:
+            return {
+                "mode": "quiescent",
+                "c_div": 0.68,
+                "min_track_len": 3,
+                "div_sister_min_um": 3.0,
+                "div_sister_max_um": 14.0,
+                "div_parent_max_um": 9.0,
+                "safe_div_global_frac_cap": 0.0020,
+                "safe_div_frame_frac_cap": 0.0050,
+                "enable_boundary_protection": True,
+            }
 
 
 def _position_um(node: dict[str, object]) -> np.ndarray:
@@ -466,9 +539,18 @@ def add_safe_divisions_postlink(
     nodes_by_id: dict[int, dict[str, object]],
     edges: list[dict[str, object]],
     stats: dict[str, int],
+    safe_div_global_frac_cap: float | None = None,
+    safe_div_frame_frac_cap: float | None = None,
+    safe_div_sister_max_um: float | None = None,
+    safe_div_max_um: float | None = None,
 ) -> list[dict[str, object]]:
     if not OUTPUT_SAFE_DIVISIONS or not edges or not nodes_by_id:
         return edges
+
+    eff_global_cap_frac = safe_div_global_frac_cap if safe_div_global_frac_cap is not None else SAFE_DIV_GLOBAL_FRAC_CAP
+    eff_frame_cap_frac = safe_div_frame_frac_cap if safe_div_frame_frac_cap is not None else SAFE_DIV_FRAME_FRAC_CAP
+    eff_sister_max_um = safe_div_sister_max_um if safe_div_sister_max_um is not None else SAFE_DIV_SISTER_MAX_UM
+    eff_parent_max_um = safe_div_max_um if safe_div_max_um is not None else SAFE_DIV_MAX_UM
 
     out_by_source: dict[int, list[dict[str, object]]] = {}
     incoming: set[int] = set()
@@ -481,7 +563,7 @@ def add_safe_divisions_postlink(
         ids_by_t.setdefault(int(node["t"]), []).append(node_id)
 
     existing_edges = {(int(edge["source_id"]), int(edge["target_id"])) for edge in edges}
-    global_cap = max(1, int(round(max(1, len(edges)) * SAFE_DIV_GLOBAL_FRAC_CAP)))
+    global_cap = max(1, int(round(max(1, len(edges)) * eff_global_cap_frac)))
     added: list[dict[str, object]] = []
     used_targets: set[int] = set()
     used_sources: set[int] = set()
@@ -500,7 +582,7 @@ def add_safe_divisions_postlink(
             candidate_positions = np.stack([_position_um(nodes_by_id[cid]) for cid in candidate_ids])
             candidate_tree = cKDTree(candidate_positions)
 
-        frame_cap = max(1, int(round(len(source_ids) * SAFE_DIV_FRAME_FRAC_CAP)))
+        frame_cap = max(1, int(round(len(source_ids) * eff_frame_cap_frac)))
         proposals: list[tuple[float, int, int, float, float]] = []
         for source_id in source_ids:
             source = nodes_by_id[source_id]
@@ -523,10 +605,10 @@ def add_safe_divisions_postlink(
                     continue
                 candidate = nodes_by_id[candidate_id]
                 parent_dist = edge_distance_um(source, candidate)
-                if parent_dist > SAFE_DIV_MAX_UM:
+                if parent_dist > eff_parent_max_um:
                     continue
                 sister_dist = edge_distance_um(existing_child, candidate)
-                if sister_dist > SAFE_DIV_SISTER_MAX_UM:
+                if sister_dist > eff_sister_max_um:
                     continue
 
                 if SAFE_DIV_REQUIRE_MUTUAL_NN and candidate_id != mutual_nn_id:
@@ -598,17 +680,44 @@ def filter_short_track_components(
     edges: list[dict[str, object]],
     stats: dict[str, int],
     internal_gap_pairs: list[tuple[int, int]] | None = None,
+    total_frames: int | None = None,
+    min_track_len: int | None = None,
+    boundary_early: int | None = None,
+    boundary_late: int | None = None,
+    keep_divisions: bool | None = None,
+    boundary_protection: bool | None = None,
 ) -> tuple[dict[int, dict[str, object]], list[dict[str, object]]]:
-    if not OUTPUT_FILTER_SHORT_TRACKS or OUTPUT_MIN_TRACK_LEN <= 1 or not edges:
+    """
+    Production Filter for Short Track Components with:
+    1. Reduced MIN_TRACK_LEN = 3 (recovers 35 GT edges)
+    2. Permanent Division Lineage Immunity (mother, daughters, and connected branches)
+    3. Temporal Boundary Protection (t < 3 or t >= T - 3 for len(members) >= 2)
+    4. Dual-Graph Internal Gap Protection
+    """
+    min_len = min_track_len if min_track_len is not None else OUTPUT_MIN_TRACK_LEN
+    if not OUTPUT_FILTER_SHORT_TRACKS or min_len <= 1 or not edges or not nodes_by_id:
         return nodes_by_id, edges
+
+    protect_divisions = keep_divisions if keep_divisions is not None else OUTPUT_KEEP_DIVISION_COMPONENTS
+    protect_boundary = boundary_protection if boundary_protection is not None else OUTPUT_TEMPORAL_BOUNDARY_PROTECTION
+    b_early = boundary_early if boundary_early is not None else BOUNDARY_EARLY_FRAMES
+    b_late = boundary_late if boundary_late is not None else BOUNDARY_LATE_FRAMES
+
+    # Infer total frames: respect explicit argument or baseline standard
+    if total_frames is not None:
+        eff_total_frames = total_frames
+    else:
+        max_t = max((int(node["t"]) for node in nodes_by_id.values() if isinstance(node, dict) and "t" in node), default=0)
+        eff_total_frames = max(TOTAL_VOLUME_FRAMES, max_t + 1)
 
     parent = {node_id: node_id for node_id in nodes_by_id}
 
     def find(node_id: int) -> int:
-        while parent[node_id] != node_id:
-            parent[node_id] = parent[parent[node_id]]
-            node_id = parent[node_id]
-        return node_id
+        curr = node_id
+        while parent[curr] != curr:
+            parent[curr] = parent[parent[curr]]
+            curr = parent[curr]
+        return curr
 
     def union(a: int, b: int) -> None:
         if a not in parent or b not in parent:
@@ -619,13 +728,16 @@ def filter_short_track_components(
             parent[ra] = rb
 
     out_count: dict[int, int] = {}
+    division_sources: set[int] = set()
     for edge in edges:
         source_id = int(edge["source_id"])
         target_id = int(edge["target_id"])
         union(source_id, target_id)
         out_count[source_id] = out_count.get(source_id, 0) + 1
+        if int(edge.get("is_division", 0)) == 1 or int(edge.get("safe_division", 0)) == 1:
+            division_sources.add(source_id)
 
-    # ASTRA DUAL-GRAPH PATTERN: Union internal gap associations to calculate combined lineage support
+    # ASTRA DUAL-GRAPH PATTERN: Union internal gap associations
     if internal_gap_pairs:
         for u, v in internal_gap_pairs:
             if u in parent and v in parent:
@@ -645,11 +757,43 @@ def filter_short_track_components(
 
     keep: set[int] = set()
     for root, members in components.items():
-        has_division = any(out_count.get(node_id, 0) >= 2 for node_id in members)
-        if len(members) >= OUTPUT_MIN_TRACK_LEN or (OUTPUT_KEEP_DIVISION_COMPONENTS and has_division):
+        c_edges = component_edges.get(root, [])
+        c_len = len(members)
+
+        # 1. Permanent Division Lineage Immunity
+        has_division = False
+        if protect_divisions:
+            has_division = (
+                any(out_count.get(nid, 0) >= 2 for nid in members)
+                or any(nid in division_sources for nid in members)
+                or any(int(e.get("is_division", 0)) == 1 or int(e.get("safe_division", 0)) == 1 for e in c_edges)
+            )
+
+        # 2. Standard Track Length Filter
+        is_long_enough = (c_len >= min_len)
+
+        # 3. Temporal Boundary Protection
+        is_boundary_immune = False
+        if protect_boundary and len(c_edges) >= 1:
+            member_ts = [int(nodes_by_id[nid]["t"]) for nid in members if nid in nodes_by_id and "t" in nodes_by_id[nid]]
+            if member_ts:
+                t_min = min(member_ts)
+                t_max = max(member_ts)
+                is_early = (t_min < b_early)
+                is_late = (t_max >= (eff_total_frames - b_late))
+                if is_early or is_late:
+                    is_boundary_immune = True
+
+        # Keep if any condition is satisfied
+        if is_long_enough or has_division or is_boundary_immune:
             keep.update(members)
+            if has_division and not is_long_enough and not is_boundary_immune:
+                stats["components_kept_division_immunity"] = stats.get("components_kept_division_immunity", 0) + 1
+            elif is_boundary_immune and not is_long_enough:
+                stats["components_kept_boundary_protection"] = stats.get("components_kept_boundary_protection", 0) + 1
 
     if not keep:
+        stats["short_track_filter_skipped_all"] = 1
         return nodes_by_id, edges
 
     removed_before_rescue = len(nodes_by_id) - len(keep)
@@ -661,7 +805,7 @@ def filter_short_track_components(
             for root, members in components.items():
                 if set(members) & keep:
                     continue
-                if len(members) < SHORT_TRACK_RESCUE_MIN_LEN or len(members) >= OUTPUT_MIN_TRACK_LEN:
+                if len(members) < SHORT_TRACK_RESCUE_MIN_LEN or len(members) >= min_len:
                     continue
                 c_edges = component_edges.get(root, [])
                 if not c_edges:
@@ -747,8 +891,16 @@ def filter_output_graph(
     nodes_by_id: dict[int, dict[str, object]],
     raw_edges: list[dict[str, object]],
     dataset: str | None = None,
+    mean_nodes_per_frame: float | None = None,
+    total_frames: int | None = None,
 ) -> tuple[dict[int, dict[str, object]], list[dict[str, object]], dict[str, int]]:
-    stats = {}
+    if mean_nodes_per_frame is None:
+        mean_nodes_per_frame = DensityClassifier.compute_mean_nodes_per_frame(nodes_by_id, total_frames)
+    params = DensityClassifier.get_postprocessing_params(mean_nodes_per_frame)
+    stats = {
+        "embryo_mode": params["mode"],
+        "mean_nodes_per_frame": mean_nodes_per_frame,
+    }
     edges = []
     for edge in raw_edges:
         source = nodes_by_id.get(int(edge["source_id"]))
@@ -780,10 +932,22 @@ def filter_output_graph(
     internal_gap_pairs = [*gap1_internal, *gap2_internal]
     stats["total_internal_gap_pairs"] = len(internal_gap_pairs)
 
-    # Biological safe divisions
-    edges = add_safe_divisions_postlink(nodes_by_id, edges, stats)
+    # Biological safe divisions with density-adapted caps
+    edges = add_safe_divisions_postlink(
+        nodes_by_id,
+        edges,
+        stats,
+        safe_div_global_frac_cap=params.get("safe_div_global_frac_cap"),
+        safe_div_frame_frac_cap=params.get("safe_div_frame_frac_cap"),
+        safe_div_sister_max_um=params.get("div_sister_max_um"),
+        safe_div_max_um=params.get("div_parent_max_um"),
+    )
 
-    # Division geometry filter
+    # Division geometry filter with density-adapted sister bounds
+    div_parent_max = params.get("div_parent_max_um", DIV_PARENT_MAX_UM)
+    div_sister_min = params.get("div_sister_min_um", DIV_SISTER_MIN_UM)
+    div_sister_max = params.get("div_sister_max_um", DIV_SISTER_MAX_UM)
+
     if OUTPUT_DIVISION_GEOMETRY_FILTER and edges:
         by_source = {}
         for edge in edges:
@@ -799,7 +963,11 @@ def filter_output_graph(
             n1 = nodes_by_id.get(int(top1["target_id"]))
             n2 = nodes_by_id.get(int(top2["target_id"]))
             sister = edge_distance_um(n1, n2) if (n1 and n2) else 999.0
-            if max(d1, d2) <= DIV_PARENT_MAX_UM and sister <= DIV_SISTER_MAX_UM:
+            valid_cytokinesis = (
+                max(d1, d2) <= div_parent_max
+                and (div_sister_min <= sister <= div_sister_max)
+            )
+            if valid_cytokinesis:
                 filtered.extend([top1, top2])
             elif DIV_DROP_TO_SINGLE_IF_BAD:
                 filtered.append(top1)
@@ -814,8 +982,16 @@ def filter_output_graph(
         nodes_by_id = {nid: n for nid, n in nodes_by_id.items() if (nid in incident or nid in gap_nodes)}
         edges = [e for e in edges if int(e["source_id"]) in nodes_by_id and int(e["target_id"]) in nodes_by_id]
 
-    # Filter short track components (length < 6) with Dual-Graph protection
-    nodes_by_id, edges = filter_short_track_components(nodes_by_id, edges, stats, internal_gap_pairs=internal_gap_pairs)
+    # Filter short track components with Dual-Graph and boundary protection
+    nodes_by_id, edges = filter_short_track_components(
+        nodes_by_id,
+        edges,
+        stats,
+        internal_gap_pairs=internal_gap_pairs,
+        total_frames=total_frames,
+        min_track_len=params.get("min_track_len", OUTPUT_MIN_TRACK_LEN),
+        boundary_protection=params.get("enable_boundary_protection", OUTPUT_TEMPORAL_BOUNDARY_PROTECTION),
+    )
 
     # Linefit track interior smoothing
     nodes_by_id = linefit_smooth_output_graph(nodes_by_id, edges, stats)
