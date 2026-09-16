@@ -18,7 +18,7 @@ from scipy.spatial import cKDTree
 VOXEL_SCALE_UM = (1.625, 0.40625, 0.40625)
 
 # Hyperparameters
-OUTPUT_EDGE_MAX_UM = 14.2
+OUTPUT_EDGE_MAX_UM = 25.0  # Synchronized with M1 Smooth Energy candidate search radius (recovers transitions up to 25.0 um)
 OUTPUT_ENFORCE_NEXT_FRAME = True
 OUTPUT_SINGLE_PARENT_REPAIR = True
 OUTPUT_PRUNE_ISOLATED = True

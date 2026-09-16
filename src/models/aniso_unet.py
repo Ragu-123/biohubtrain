@@ -116,22 +116,38 @@ class AnisoResBlock3D(nn.Module):
         return self.act(out + residual)
 
 
-class PhysicalLaplacianCrossFusion(nn.Module):
+class PhysicalLaplacianCrossFusionV2(nn.Module):
     """
-    Computes discrete physical anisotropic 3D Laplacian and injects membrane boundary
-    cues into feature maps via cross-gating:
-      Lap_S(I) = (1/s_z^2) d^2 I/dz^2 + (1/s_y^2) d^2 I/dy^2 + (1/s_x^2) d^2 I/dx^2
+    Enhanced Discrete 3D Anisotropic Physical Laplacian Membrane Gating (V2).
+    Finite Difference Weights:
+      w_z = 0.3787 um^-2, w_y = w_x = 6.0592 um^-2, w_center = -24.9941 um^-2
+    Features:
+      1. Separable anisotropic Gaussian pre-smoothing to suppress microscopy shot noise.
+      2. Dual-stream decomposition into concave nuclear cores and convex cleavage furrows.
+      3. Scale-normalized [-1, 1] InstanceNorm dynamic range protection.
+      4. Asymmetric furrow notch filtering (alpha_core=0.5, beta_furrow=0.7).
     """
-    def __init__(self, out_channels: int, scale: tuple[float, float, float] = (1.625, 0.40625, 0.40625)):
+    def __init__(
+        self,
+        out_channels: int,
+        scale: tuple[float, float, float] = (1.625, 0.40625, 0.40625),
+        alpha_core: float = 0.5,
+        beta_furrow: float = 0.7,
+        smooth_noise: bool = True,
+    ):
         super().__init__()
+        self.out_channels = out_channels
+        self.alpha_core = alpha_core
+        self.beta_furrow = beta_furrow
+        self.smooth_noise = smooth_noise
+
         sz, sy, sx = scale
-        # Physical finite difference weights: 1/s_d^2
         w_z = 1.0 / (sz ** 2)
         w_y = 1.0 / (sy ** 2)
         w_x = 1.0 / (sx ** 2)
         w_center = -2.0 * (w_z + w_y + w_x)
 
-        # 3x3x3 discrete Laplacian filter
+        # 3x3x3 discrete anisotropic physical Laplacian kernel
         lap_kernel = torch.zeros((1, 1, 3, 3, 3), dtype=torch.float32)
         lap_kernel[0, 0, 1, 1, 1] = w_center
         lap_kernel[0, 0, 0, 1, 1] = w_z
@@ -141,19 +157,61 @@ class PhysicalLaplacianCrossFusion(nn.Module):
         lap_kernel[0, 0, 1, 1, 0] = w_x
         lap_kernel[0, 0, 1, 1, 2] = w_x
         self.register_buffer("lap_kernel", lap_kernel)
+        self.scale_norm = 1.0 / abs(w_center)
 
-        self.gate_proj = nn.Conv3d(1, out_channels, kernel_size=1)
-        self.val_proj = nn.Conv3d(1, out_channels, kernel_size=1)
+        # Separable 1D Gaussian kernels for noise pre-smoothing (sigma_z=0.5, sigma_xy=1.0)
+        kz = torch.tensor([0.2740686, 0.4518628, 0.2740686], dtype=torch.float32).view(1, 1, 3, 1, 1)
+        ky = torch.tensor([0.27901, 0.44198, 0.27901], dtype=torch.float32).view(1, 1, 1, 3, 1)
+        kx = torch.tensor([0.27901, 0.44198, 0.27901], dtype=torch.float32).view(1, 1, 1, 1, 3)
+        self.register_buffer("kz", kz)
+        self.register_buffer("ky", ky)
+        self.register_buffer("kx", kx)
 
-    def forward(self, feat: torch.Tensor, raw_img: torch.Tensor) -> torch.Tensor:
+        # Dual-stream projections
+        self.core_proj = nn.Sequential(
+            nn.Conv3d(1, out_channels, kernel_size=1, bias=True),
+            nn.InstanceNorm3d(out_channels, affine=True),
+            nn.Sigmoid(),
+        )
+        self.furrow_proj = nn.Sequential(
+            nn.Conv3d(1, out_channels, kernel_size=1, bias=True),
+            nn.InstanceNorm3d(out_channels, affine=True),
+            nn.Sigmoid(),
+        )
+        self.val_proj = nn.Conv3d(1, out_channels, kernel_size=1, bias=False)
+
+    def forward(self, feat: torch.Tensor, raw_img: torch.Tensor, return_furrow: bool = False):
         # raw_img: (B, 1, Z, Y, X)
-        lap = F.conv3d(raw_img, self.lap_kernel.to(raw_img.dtype), padding=1)
+        x = raw_img
+        if self.smooth_noise and x.shape[2] >= 3 and x.shape[3] >= 3 and x.shape[4] >= 3:
+            x = F.conv3d(x, self.kz.to(x.dtype), padding=(1, 0, 0))
+            x = F.conv3d(x, self.ky.to(x.dtype), padding=(0, 1, 0))
+            x = F.conv3d(x, self.kx.to(x.dtype), padding=(0, 0, 1))
+
+        lap = F.conv3d(x, self.lap_kernel.to(x.dtype), padding=1)
         if lap.shape[2:] != feat.shape[2:]:
             lap = F.interpolate(lap, size=feat.shape[2:], mode="trilinear", align_corners=False)
 
-        gate = torch.sigmoid(self.gate_proj(lap))
-        val = self.val_proj(lap)
-        return feat * (1.0 + gate) + val
+        # Scale normalize to [-1.0, 1.0]
+        lap_scaled = lap * self.scale_norm
+
+        # Dual-stream curvature separation
+        lap_pos = F.relu(lap_scaled)   # Cleavage furrow ridges
+        lap_neg = F.relu(-lap_scaled)  # Nuclear mass cores
+
+        gate_core = self.core_proj(lap_neg)
+        gate_furrow = self.furrow_proj(lap_pos)
+        val = self.val_proj(lap_scaled)
+
+        # Asymmetric notch cross-gating
+        feat_out = feat * (1.0 + self.alpha_core * gate_core) * (1.0 - self.beta_furrow * gate_furrow) + val
+        if return_furrow:
+            return feat_out, lap_pos
+        return feat_out
+
+
+# Alias for backwards compatibility
+PhysicalLaplacianCrossFusion = PhysicalLaplacianCrossFusionV2
 
 
 class DiffeomorphicFlowHead(nn.Module):
@@ -172,26 +230,41 @@ class DiffeomorphicFlowHead(nn.Module):
         # Small initialization so initial deformation is near identity
         nn.init.normal_(self.flow_conv[-1].weight, std=1e-4)
         nn.init.constant_(self.flow_conv[-1].bias, 0.0)
+        self._cached_shape = None
+        self._cached_grid = None
+        self._cached_scale = None
 
-    def forward(self, feat: torch.Tensor):
-        # feat: (B, C, Z, Y, X)
-        v = self.flow_conv(feat)  # (B, 3, Z, Y, X) where channels are (dz, dy, dx) in voxels
+    def integrate_svf(self, v: torch.Tensor) -> torch.Tensor:
+        """
+        6-step scaling-and-squaring Lie group exp map: phi = exp(v).
+        Returns displacement field disp = phi(x) - x in voxels.
+        """
+        B, _, Z, Y, X = v.shape
         u = v / (2.0 ** self.num_steps)
-        B, _, Z, Y, X = u.shape
 
-        # Identity grid in [-1, 1] normalized coordinates for grid_sample (x, y, z)
-        grid_z, grid_y, grid_x = torch.meshgrid(
-            torch.linspace(-1.0, 1.0, Z, device=feat.device, dtype=feat.dtype),
-            torch.linspace(-1.0, 1.0, Y, device=feat.device, dtype=feat.dtype),
-            torch.linspace(-1.0, 1.0, X, device=feat.device, dtype=feat.dtype),
-            indexing="ij"
-        )
-        base_grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).unsqueeze(0).expand(B, -1, -1, -1, -1)
+        if (
+            self._cached_shape != (Z, Y, X)
+            or self._cached_grid is None
+            or self._cached_grid.device != v.device
+            or self._cached_grid.dtype != v.dtype
+        ):
+            grid_z, grid_y, grid_x = torch.meshgrid(
+                torch.linspace(-1.0, 1.0, Z, device=v.device, dtype=v.dtype),
+                torch.linspace(-1.0, 1.0, Y, device=v.device, dtype=v.dtype),
+                torch.linspace(-1.0, 1.0, X, device=v.device, dtype=v.dtype),
+                indexing="ij"
+            )
+            base_grid = torch.stack([grid_x, grid_y, grid_z], dim=-1).unsqueeze(0)
+            scale_vec = torch.tensor(
+                [2.0 / max(X - 1, 1), 2.0 / max(Y - 1, 1), 2.0 / max(Z - 1, 1)],
+                device=v.device, dtype=v.dtype
+            )
+            self._cached_grid = base_grid
+            self._cached_scale = scale_vec
+            self._cached_shape = (Z, Y, X)
 
-        scale_vec = torch.tensor(
-            [2.0 / max(X - 1, 1), 2.0 / max(Y - 1, 1), 2.0 / max(Z - 1, 1)],
-            device=feat.device, dtype=feat.dtype
-        )
+        base_grid = self._cached_grid.expand(B, -1, -1, -1, -1)
+        scale_vec = self._cached_scale
 
         disp = u
         for _ in range(self.num_steps):
@@ -200,7 +273,12 @@ class DiffeomorphicFlowHead(nn.Module):
             sample_grid = (base_grid + disp_norm).clamp(-1.5, 1.5)
             disp_warped = F.grid_sample(disp, sample_grid, mode="bilinear", padding_mode="border", align_corners=True)
             disp = disp + disp_warped
+        return disp
 
+    def forward(self, feat: torch.Tensor):
+        # feat: (B, C, Z, Y, X)
+        v = self.flow_conv(feat)  # (B, 3, Z, Y, X) where channels are (dz, dy, dx) in voxels
+        disp = self.integrate_svf(v)
         return v, disp
 
 
@@ -330,11 +408,13 @@ class AnisoUNet3D(nn.Module):
             else:
                 curr = dec(curr)
 
-        # Inject physical Laplacian boundary cues
-        curr = self.lap_fusion(curr, x)
+        # Inject physical Laplacian boundary cues and extract furrow notch map
+        curr, furrow_map = self.lap_fusion(curr, x, return_furrow=True)
 
         feat = self.head(curr)
         det_logits, sub_deltas = self.refiner(feat)
+        # Direct cleavage furrow notch depression to prevent peak bridging
+        det_logits = det_logits - 3.50 * furrow_map
         v, disp = self.flow_head(feat)
         return feat, det_logits, sub_deltas, (v, disp)
 

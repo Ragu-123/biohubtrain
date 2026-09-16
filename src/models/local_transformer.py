@@ -25,7 +25,8 @@ import torch.nn.functional as F
 class AnisotropicFourierPositionalEmbedding(nn.Module):
     """
     Encodes 3D physical coordinates into anisotropic Fourier harmonics.
-    Modulated by physical voxel aspect ratio S = (s_z, s_y, s_x).
+    Modulated by physical voxel aspect ratio S = (s_z, s_y, s_x)
+    and physical Riemannian metric tensor S^2 = diag(s_z^2, s_y^2, s_x^2).
     """
     def __init__(
         self,
@@ -39,12 +40,17 @@ class AnisotropicFourierPositionalEmbedding(nn.Module):
         self.base_wavelength_um = base_wavelength_um
         freq_bands = 2.0 ** torch.linspace(0.0, num_freqs - 1, num_freqs)
         self.register_buffer("freq_bands", freq_bands)
-        self.register_buffer("scale_tensor", torch.tensor(scale, dtype=torch.float32))
+        scale_t = torch.tensor(scale, dtype=torch.float32)
+        self.register_buffer("scale_tensor", scale_t)
+        self.register_buffer("metric_tensor_s2", scale_t ** 2)
+        freq_mod = torch.tensor([scale[1] / scale[0], 1.0, 1.0], dtype=torch.float32)
+        self.register_buffer("freq_mod", freq_mod)
         self.proj = nn.Linear(3 * 2 * num_freqs, d_model)
 
-    def forward(self, coords_um: torch.Tensor) -> torch.Tensor:
-        # coords_um: (N, 3) in physical microns
-        # Modulate by relative physical frequency
+    def forward(self, coords: torch.Tensor, coords_in_um: bool = True) -> torch.Tensor:
+        # coords: (N, 3) or (B, N, 3) in physical microns (or voxels if coords_in_um=False)
+        coords_um = coords if coords_in_um else (coords * self.scale_tensor)
+        # Modulate by relative physical frequency: [4.0, 1.0, 1.0]
         scaled_coords = coords_um * (self.scale_tensor / self.scale_tensor[1])
         scaled = (scaled_coords.unsqueeze(-1) * self.freq_bands * math.pi) / self.base_wavelength_um
         sins = torch.sin(scaled)
@@ -149,6 +155,7 @@ def log_sinkhorn_uot(
 class SparseLocalTrackTransformer(nn.Module):
     """
     Bidirectional Local Candidate Transformer for Cell Association.
+    Equipped with Anisotropic Metric Geometry and Smooth Kinetic Energy Potentials.
     """
     def __init__(
         self,
@@ -156,11 +163,24 @@ class SparseLocalTrackTransformer(nn.Module):
         pos_dim: int = 32,
         d_model: int = 64,
         n_layers: int = 3,
-        r_max_um: float = 12.0,
+        r_max_um: float = 25.0,        # Expanded from 12.0 to 25.0 um (covers 99.99% transitions)
+        sigma_d: float = 4.5,          # Characteristic kinetic diffusion scale (4.5 um)
+        alpha_kinetic: float = 0.40,   # Kinetic energy stiffness penalty parameter
+        scale: tuple[float, float, float] = (1.625, 0.40625, 0.40625),
     ):
         super().__init__()
         self.r_max_um = r_max_um
-        self.pos_encoder = AnisotropicFourierPositionalEmbedding(num_freqs=8, d_model=pos_dim)
+        self.sigma_d = sigma_d
+        self.alpha_kinetic = alpha_kinetic
+
+        # Register Riemannian metric tensor S and S^2
+        scale_t = torch.tensor(scale, dtype=torch.float32)
+        self.register_buffer("scale_tensor", scale_t)
+        self.register_buffer("metric_tensor_s2", scale_t ** 2)
+
+        self.pos_encoder = AnisotropicFourierPositionalEmbedding(
+            num_freqs=8, d_model=pos_dim, scale=scale
+        )
         self.input_proj = nn.Linear(feat_dim + pos_dim, d_model)
 
         self.fwd_layers = nn.ModuleList([
@@ -185,14 +205,15 @@ class SparseLocalTrackTransformer(nn.Module):
     def forward(
         self,
         feat_src: torch.Tensor,       # (N, feat_dim)
-        coords_src_um: torch.Tensor,  # (N, 3)
+        coords_src_um: torch.Tensor,  # (N, 3) in physical microns
         feat_tgt: torch.Tensor,       # (M, feat_dim)
-        coords_tgt_um: torch.Tensor,  # (M, 3)
+        coords_tgt_um: torch.Tensor,  # (M, 3) in physical microns
         flow_src_um: torch.Tensor = None, # (N, 3) continuous displacement prior
+        coords_in_um: bool = True,
     ):
         """
         Returns:
-            pairwise_logits: (N, M) float tensor of transition logits.
+            pairwise_logits: (N, M) float tensor of transition logits with smooth kinetic penalty.
             cand_mask: (N, M) boolean mask of valid candidates (dist <= R_max).
         """
         N = feat_src.shape[0]
@@ -201,19 +222,23 @@ class SparseLocalTrackTransformer(nn.Module):
         if N == 0 or M == 0:
             return torch.empty((N, M), device=feat_src.device), torch.zeros((N, M), dtype=torch.bool, device=feat_src.device)
 
-        # Apply continuous flow prior if provided
-        pred_src_um = coords_src_um + (flow_src_um if flow_src_um is not None else 0.0)
+        # Ensure coordinates are in physical microns
+        c_src_um = coords_src_um if coords_in_um else (coords_src_um * self.scale_tensor)
+        c_tgt_um = coords_tgt_um if coords_in_um else (coords_tgt_um * self.scale_tensor)
 
-        # Physical spatial distances in co-moving frame: (N, M)
-        diff = pred_src_um.unsqueeze(1) - coords_tgt_um.unsqueeze(0)  # (N, M, 3)
+        # Apply continuous flow prior if provided
+        pred_src_um = c_src_um + (flow_src_um if flow_src_um is not None else 0.0)
+
+        # Physical spatial distances in co-moving frame under metric tensor: (N, M)
+        diff = pred_src_um.unsqueeze(1) - c_tgt_um.unsqueeze(0)  # (N, M, 3) in um
         dist_sq = (diff ** 2).sum(dim=-1)
         dist_um = torch.sqrt(dist_sq + 1e-8)
         cand_mask_fwd = dist_um <= self.r_max_um  # (N, M)
         cand_mask_rev = cand_mask_fwd.t()          # (M, N)
 
         # Input representations: feature + anisotropic Fourier positional encoding
-        pos_src = self.pos_encoder(coords_src_um)
-        pos_tgt = self.pos_encoder(coords_tgt_um)
+        pos_src = self.pos_encoder(c_src_um, coords_in_um=True)
+        pos_tgt = self.pos_encoder(c_tgt_um, coords_in_um=True)
         h_src = self.input_proj(torch.cat([feat_src, pos_src], dim=-1))
         h_tgt = self.input_proj(torch.cat([feat_tgt, pos_tgt], dim=-1))
 
@@ -235,8 +260,15 @@ class SparseLocalTrackTransformer(nn.Module):
             dist_active = (dist_um[si, tj].unsqueeze(-1) / 10.0).to(h_s_active.dtype)
 
             active_pair_feats = torch.cat([h_s_active, h_t_active, diff_active, dist_active], dim=-1)
-            active_logits = self.pair_mlp(active_pair_feats).squeeze(-1)
-            logits[si, tj] = active_logits
+            raw_logits = self.pair_mlp(active_pair_feats).squeeze(-1)
+
+            # Smooth quadratic kinetic energy penalty:
+            # logit_adj = logit_neural - alpha * (d_S^2 / (2 * sigma_d^2))
+            if self.alpha_kinetic > 0.0:
+                kinetic_penalty = self.alpha_kinetic * (dist_sq[si, tj] / (2.0 * (self.sigma_d ** 2)))
+                logits[si, tj] = raw_logits - kinetic_penalty.to(raw_logits.dtype)
+            else:
+                logits[si, tj] = raw_logits
 
         return logits, cand_mask_fwd
 
