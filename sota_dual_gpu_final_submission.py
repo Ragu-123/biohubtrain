@@ -134,8 +134,6 @@ try:
     import ilpy
     import tracksdata as td
     from tracksdata.solvers import _ilp_solver
-    from postprocess_clean import filter_output_graph, DensityClassifier, VOXEL_SCALE_UM
-    from duplicate_parent_solver import DuplicateParentTrackingSolver
 
     # Direct SCIP Solver backend: bypasses Gurobi check and eliminates traceback completely
     def _direct_scip_solve(self):
@@ -163,6 +161,16 @@ try:
     _ilp_solver.ILPSolver._solve = _direct_scip_solve
 except ImportError:
     pass
+
+try:
+    from postprocess_clean import filter_output_graph, DensityClassifier, VOXEL_SCALE_UM
+except ImportError:
+    from biohubtrain.postprocess_clean import filter_output_graph, DensityClassifier, VOXEL_SCALE_UM
+
+try:
+    from duplicate_parent_solver import DuplicateParentTrackingSolver
+except ImportError:
+    from biohubtrain.duplicate_parent_solver import DuplicateParentTrackingSolver
 
 
 try:
