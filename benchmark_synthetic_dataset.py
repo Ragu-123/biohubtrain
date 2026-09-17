@@ -64,7 +64,7 @@ def evaluate_sequence(
         # Pairwise physical anisotropic distances in microns
         dists = compute_pairwise_physical_distances(src_coords, tgt_coords, scale)
         
-        # Kinetic transition probability
+        # Kinetic transition probability with gentle decay for cytokinesis
         probs = np.exp(- (dists ** 2) / (2.0 * sigma_d ** 2))
         probs[dists > r_horizon_um] = 0.0
 
@@ -100,10 +100,11 @@ def evaluate_sequence(
     # Set voxel scale in postprocess_clean
     postprocess_clean.VOXEL_SCALE_UM = scale
 
-    # Filter with postprocess_clean
+    # Filter with postprocess_clean in mitotic mode (accommodating high-mitosis synthetic volumes)
     kept_nodes, kept_edges, _ = postprocess_clean.filter_output_graph(
         nodes_by_id=nodes_by_id,
         raw_edges=pred_edges,
+        mean_nodes_per_frame=500.0,
         total_frames=len(frames),
     )
 
@@ -159,7 +160,8 @@ def main():
     parser = argparse.ArgumentParser(description="Benchmark Synthetic 3D Cell Tracking Dataset")
     parser.add_argument("--data_dir", type=str, default="/kaggle/input/notebooks/josefreitasalvesneto/biohub-synthetic-dataset/biohub_synthetic/sequences")
     parser.add_argument("--num_seqs", type=int, default=50, help="Number of sequences to evaluate")
-    parser.add_argument("--c_div", type=float, default=0.75, help="Division cost threshold penalty")
+    parser.add_argument("--c_div", type=float, default=0.20, help="Division cost threshold penalty")
+    parser.add_argument("--sigma_d", type=float, default=5.5, help="Dispersion scale parameter")
     args = parser.parse_args()
 
     if not os.path.exists(args.data_dir):
@@ -173,7 +175,7 @@ def main():
     print("=" * 80)
     print(f"🚀 RUNNING MULTI-SEQUENCE BENCHMARK ON {num_to_eval} SYNTHETIC SEQUENCES")
     print(f"Data directory: {args.data_dir}")
-    print(f"Division penalty c_div: {args.c_div}")
+    print(f"Division penalty c_div: {args.c_div} | sigma_d: {args.sigma_d}")
     print("=" * 80)
 
     # Setup solver with calibrated parameters
@@ -203,7 +205,7 @@ def main():
     for idx, fname in enumerate(selected_files):
         fpath = os.path.join(args.data_dir, fname)
         t_seq = time.time()
-        res = evaluate_sequence(fpath, solver)
+        res = evaluate_sequence(fpath, solver, sigma_d=args.sigma_d)
         dt = time.time() - t_seq
         results.append(res)
 
