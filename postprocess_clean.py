@@ -456,7 +456,7 @@ def recover_strict_gap2(
 
     proposals.sort(key=lambda item: item[0])
     if not proposals:
-        return nodes_by_id, edges
+        return nodes_by_id, edges, []
 
     selected = []
     used_ends: set[int] = set()
