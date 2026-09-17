@@ -769,7 +769,7 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
     t_solver = time.time()
     total_frames = max((int(c[0]) for c in coords_orig), default=0) + 1 if len(coords_orig) else 100
     mean_density = len(coords_orig) / max(total_frames, 1)
-    c_div = DensityClassifier.get_calibrated_division_cost(mean_density)
+    c_div = float(os.environ.get("BIOHUB_C_DIV", "1.20"))
 
     v_scale = tuple(float(s) for s in scale) if hasattr(scale, "__iter__") else VOXEL_SCALE_UM
     solver = DuplicateParentTrackingSolver(
