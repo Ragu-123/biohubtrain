@@ -86,31 +86,29 @@ def evaluate_sequence(
             })
 
     # Prepare input for postprocess_clean
-    nodes_df = pl.DataFrame({
-        'node_id': [int(i) for i in range(len(raw_nodes))],
-        't': [int(r[0]) for r in raw_nodes],
-        'z': [float(r[1]) for r in raw_nodes],
-        'y': [float(r[2]) for r in raw_nodes],
-        'x': [float(r[3]) for r in raw_nodes],
-    })
+    nodes_by_id = {
+        int(i): {
+            'node_id': int(i),
+            't': int(raw_nodes[i, 0]),
+            'z': float(raw_nodes[i, 1]),
+            'y': float(raw_nodes[i, 2]),
+            'x': float(raw_nodes[i, 3]),
+        }
+        for i in range(len(raw_nodes))
+    }
 
-    edges_df = pl.DataFrame(pred_edges) if pred_edges else pl.DataFrame({
-        'source_id': pl.Series([], dtype=pl.Int64),
-        'target_id': pl.Series([], dtype=pl.Int64),
-        'edge_prob': pl.Series([], dtype=pl.Float64),
-        'distance_um': pl.Series([], dtype=pl.Float64),
-        'is_division': pl.Series([], dtype=pl.Int64),
-    })
+    # Set voxel scale in postprocess_clean
+    postprocess_clean.VOXEL_SCALE_UM = scale
 
     # Filter with postprocess_clean
-    filt_nodes, filt_edges, _ = postprocess_clean.filter_output_graph(
-        nodes_df=nodes_df,
-        edges_df=edges_df,
-        voxel_scale=scale,
+    kept_nodes, kept_edges, _ = postprocess_clean.filter_output_graph(
+        nodes_by_id=nodes_by_id,
+        raw_edges=pred_edges,
+        total_frames=len(frames),
     )
 
     # Reconstruct predicted edges and divisions
-    pred_edge_set = set(zip(filt_edges['source_id'].to_list(), filt_edges['target_id'].to_list()))
+    pred_edge_set = set(zip([int(e['source_id']) for e in kept_edges], [int(e['target_id']) for e in kept_edges]))
     
     # Predicted divisions: parent nodes with out-degree >= 2
     out_degree = {}
