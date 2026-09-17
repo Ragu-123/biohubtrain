@@ -893,10 +893,13 @@ def filter_output_graph(
     dataset: str | None = None,
     mean_nodes_per_frame: float | None = None,
     total_frames: int | None = None,
+    custom_params: dict[str, Any] | None = None,
 ) -> tuple[dict[int, dict[str, object]], list[dict[str, object]], dict[str, int]]:
     if mean_nodes_per_frame is None:
         mean_nodes_per_frame = DensityClassifier.compute_mean_nodes_per_frame(nodes_by_id, total_frames)
     params = DensityClassifier.get_postprocessing_params(mean_nodes_per_frame)
+    if custom_params:
+        params.update(custom_params)
     stats = {
         "embryo_mode": params["mode"],
         "mean_nodes_per_frame": mean_nodes_per_frame,

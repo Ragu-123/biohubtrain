@@ -101,11 +101,18 @@ def evaluate_sequence(
     postprocess_clean.VOXEL_SCALE_UM = scale
 
     # Filter with postprocess_clean in mitotic mode (accommodating high-mitosis synthetic volumes)
+    custom_params = {
+        "safe_div_global_frac_cap": 0.08,
+        "safe_div_frame_frac_cap": 0.12,
+        "div_sister_max_um": 18.0,
+        "div_parent_max_um": 10.0,
+    }
     kept_nodes, kept_edges, _ = postprocess_clean.filter_output_graph(
         nodes_by_id=nodes_by_id,
         raw_edges=pred_edges,
         mean_nodes_per_frame=500.0,
         total_frames=len(frames),
+        custom_params=custom_params,
     )
 
     # Reconstruct predicted edges and divisions
