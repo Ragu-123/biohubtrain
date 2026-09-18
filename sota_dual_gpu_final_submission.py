@@ -17,6 +17,7 @@ import json
 os.environ.setdefault("POLARS_PREFER_PKG", "32")
 
 import time
+import queue
 import zipfile
 import multiprocessing as mp
 from pathlib import Path
@@ -824,17 +825,27 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
     return stem, filt_nodes, filt_edges
 
 
-def gpu_worker(gpu_id: int, volume_paths: list[Path], return_dict):
+def gpu_worker(gpu_id: int, task_source, return_dict):
+    torch.backends.cudnn.benchmark = True
     device = torch.device(f"cuda:{gpu_id}")
-    print(f"Worker for {device} initialized with {len(volume_paths)} volume(s).", flush=True)
+    print(f"Worker for {device} initialized.", flush=True)
 
     m0, window_size, downsample = load_robust_model(PRIMARY_WEIGHTS, device)
     m1, _, _ = load_robust_model(SEED_WEIGHTS, device)
 
     worker_results = []
-    for vp in volume_paths:
-        res = process_single_volume(vp, device, m0, m1, window_size, downsample)
-        worker_results.append(res)
+    if isinstance(task_source, list):
+        for vp in task_source:
+            res = process_single_volume(vp, device, m0, m1, window_size, downsample)
+            worker_results.append(res)
+    else:
+        while True:
+            try:
+                vp = task_source.get_nowait()
+            except (queue.Empty, Exception):
+                break
+            res = process_single_volume(vp, device, m0, m1, window_size, downsample)
+            worker_results.append(res)
 
     return_dict[gpu_id] = worker_results
 
@@ -932,16 +943,22 @@ def main():
     print(f"Available GPUs: {n_gpus}")
 
     if n_gpus >= 2 and len(all_zarrs) >= 2:
-        gpu0_vols = all_zarrs[::2]
-        gpu1_vols = all_zarrs[1::2]
-        print(f"cuda:0 tasks ({len(gpu0_vols)}): {[z.name for z in gpu0_vols]}")
-        print(f"cuda:1 tasks ({len(gpu1_vols)}): {[z.name for z in gpu1_vols]}")
+        # Sort volumes descending by total file size (Longest Processing Time first)
+        sorted_vols = sorted(
+            all_zarrs,
+            key=lambda p: sum(f.stat().st_size for f in p.rglob("*") if f.is_file()),
+            reverse=True,
+        )
+        print(f"LPT dynamic queue order ({len(sorted_vols)}): {[z.name for z in sorted_vols]}")
 
         manager = mp.Manager()
+        task_queue = manager.Queue()
+        for v in sorted_vols:
+            task_queue.put(v)
         return_dict = manager.dict()
 
-        p0 = mp.Process(target=gpu_worker, args=(0, gpu0_vols, return_dict))
-        p1 = mp.Process(target=gpu_worker, args=(1, gpu1_vols, return_dict))
+        p0 = mp.Process(target=gpu_worker, args=(0, task_queue, return_dict))
+        p1 = mp.Process(target=gpu_worker, args=(1, task_queue, return_dict))
 
         p0.start()
         p1.start()
