@@ -316,7 +316,7 @@ KINETIC_ALPHA              = 0.40                 # Quadratic kinetic stiffness 
 DET_THRESHOLD              = 0.96875
 POOL_KERNEL_UM             = 3.0
 EDGE_STRONG_THRESH         = 0.40
-EDGE_MIN_THRESH            = 0.05                 # Relaxed from 0.15 to 0.05 to preserve distant dividing daughter candidates
+EDGE_MIN_THRESH            = 0.010                # Relaxed from 0.05 to 0.010 to preserve distant dividing daughter candidates
 EDGE_TOPK_PARENTS          = 6                    # Expanded from 4 to 6 to recover candidate window drops in dense clusters
 EDGE_MAX_DISTANCE_UM       = CANDIDATE_SEARCH_RADIUS_UM  # 25.0 um
 
@@ -533,7 +533,7 @@ def compute_anisotropic_candidates_with_smooth_potential(
     search_radius_um: float = CANDIDATE_SEARCH_RADIUS_UM,
     sigma_d: float = KINETIC_SIGMA_D_UM,
     alpha: float = KINETIC_ALPHA,
-    min_adj_prob: float = 0.01,
+    min_adj_prob: float = 0.005,
 ) -> list[tuple[int, int, float, float]]:
     """
     Constructs candidate tracking edges using physical anisotropic metric geometry,
@@ -785,10 +785,10 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
         min_sister_dist_um=10.0 if mean_density < 250.0 else 7.5,
         max_sister_dist_um=params["div_sister_max_um"],
         max_parent_dist_um=params["div_parent_max_um"],
-        max_sister_symmetry_tau=0.60,
+        max_sister_symmetry_tau=0.92,
         r_max_um=params.get("r_max_um", 25.0),
         voxel_scale=v_scale,
-        max_cleavage_cos_angle=0.0,
+        max_cleavage_cos_angle=0.15,
         use_mejc=True,
         mejc_phi_weight=0.35,
         mejc_d_mid_max_um=5.0,
@@ -851,7 +851,8 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
     filt_nodes, filt_edges, stats = filter_output_graph(
         nodes_by_id, raw_edges, dataset=stem,
         mean_nodes_per_frame=mean_density, total_frames=total_frames,
-        min_sister_dist_um=8.0, max_sister_tau=0.60, production=True,
+        min_sister_dist_um=8.0, max_sister_tau=0.92, production=True,
+        custom_params={"div_parent_max_um": 10.5, "div_symmetry_max_tau": 0.92},
     )
     dt = time.time() - t0
     pruned = len(nodes_by_id) - len(filt_nodes)

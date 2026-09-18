@@ -234,7 +234,7 @@ class DuplicateParentTrackingSolver:
         min_daughter_divergence_angle_deg: Optional[float] = None,
         check_cleavage_divergence: bool = False,
         daughter_cleavage_divergence_angle: Optional[float] = None,
-        use_mejc: bool = False,
+        use_mejc: bool = True,
         mejc_phi_weight: float = 0.35,
         mejc_d_mid_max_um: Optional[float] = 5.0,
         mejc_min_prob: float = 0.005,
@@ -389,7 +389,7 @@ class DuplicateParentTrackingSolver:
                     psi_mid = float(np.exp(-0.5 * (d_mid / 2.5) ** 2))
                     psi_sep = float(1.0 / (1.0 + np.exp(-(d_sister - 8.0) / 1.0)))
                     psi_div = float((1.0 - cos_theta) / 2.0)
-                    psi_sym = float(np.exp(-0.5 * (tau / 0.60) ** 2))
+                    psi_sym = float(np.exp(-0.5 * (tau / 0.90) ** 2))
                     phi_spindle = psi_mid * psi_sep * psi_div * psi_sym
 
                     # Joint division profit: W_div = P1 + P2 + 2*c_app - c_div + beta*phi
