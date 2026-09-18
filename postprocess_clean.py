@@ -62,7 +62,7 @@ OUTPUT_DIVISION_GEOMETRY_FILTER = True
 DIV_PARENT_MAX_UM = 10.5
 DIV_SISTER_MIN_UM = 3.0               # Lower cytokinesis bound (suppresses duplicate detections)
 DIV_SISTER_MAX_UM = 18.0              # Upper cytokinesis bound (synchronized with M3 solver: was 14.0)
-DIV_SYMMETRY_MAX_TAU = 0.92           # Cytokinesis bilateral symmetry gate relaxed to 0.92 for asymmetric divisions
+DIV_SYMMETRY_MAX_TAU = 0.96           # Cytokinesis bilateral symmetry gate relaxed to 0.96 for asymmetric divisions
 DIV_DROP_TO_SINGLE_IF_BAD = True
 
 OUTPUT_FILTER_SHORT_TRACKS = True
@@ -135,7 +135,7 @@ class DensityClassifier:
                 "div_sister_min_um": 3.0,
                 "div_sister_max_um": 18.0,
                 "div_parent_max_um": 10.0,
-                "div_symmetry_max_tau": 0.92,
+                "div_symmetry_max_tau": 0.96,
                 "safe_div_global_frac_cap": 0.0050,
                 "safe_div_frame_frac_cap": 0.0100,
                 "enable_boundary_protection": True,
@@ -149,7 +149,7 @@ class DensityClassifier:
                 "div_sister_min_um": 3.0,
                 "div_sister_max_um": 14.0,
                 "div_parent_max_um": 9.0,
-                "div_symmetry_max_tau": 0.92,
+                "div_symmetry_max_tau": 0.96,
                 "safe_div_global_frac_cap": 0.0020,
                 "safe_div_frame_frac_cap": 0.0050,
                 "enable_boundary_protection": True,

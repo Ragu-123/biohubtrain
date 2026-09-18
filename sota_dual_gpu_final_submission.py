@@ -785,13 +785,13 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
         min_sister_dist_um=10.0 if mean_density < 250.0 else 7.5,
         max_sister_dist_um=params["div_sister_max_um"],
         max_parent_dist_um=params["div_parent_max_um"],
-        max_sister_symmetry_tau=0.92,
+        max_sister_symmetry_tau=0.96,
         r_max_um=params.get("r_max_um", 25.0),
         voxel_scale=v_scale,
         max_cleavage_cos_angle=0.15,
         use_mejc=True,
         mejc_phi_weight=0.35,
-        mejc_d_mid_max_um=5.0,
+        mejc_d_mid_max_um=5.5,
         mejc_min_prob=0.25 if mean_density < 250.0 else 0.005,
     )
 
@@ -851,8 +851,8 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
     filt_nodes, filt_edges, stats = filter_output_graph(
         nodes_by_id, raw_edges, dataset=stem,
         mean_nodes_per_frame=mean_density, total_frames=total_frames,
-        min_sister_dist_um=8.0, max_sister_tau=0.92, production=True,
-        custom_params={"div_parent_max_um": 10.5, "div_symmetry_max_tau": 0.92},
+        min_sister_dist_um=8.0, max_sister_tau=0.96, production=True,
+        custom_params={"div_parent_max_um": 10.5, "div_symmetry_max_tau": 0.96},
     )
     dt = time.time() - t0
     pruned = len(nodes_by_id) - len(filt_nodes)
