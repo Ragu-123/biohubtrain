@@ -25,7 +25,8 @@ from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import polars as pl
-from scipy.optimize import linear_sum_assignment
+from scipy.optimize import linear_sum_assignment, milp, LinearConstraint, Bounds
+import scipy.sparse as sp
 
 # Standard physical constants per competition specifications
 VOXEL_SCALE_UM: Tuple[float, float, float] = (1.625, 0.40625, 0.40625)
@@ -233,6 +234,11 @@ class DuplicateParentTrackingSolver:
         min_daughter_divergence_angle_deg: Optional[float] = None,
         check_cleavage_divergence: bool = False,
         daughter_cleavage_divergence_angle: Optional[float] = None,
+        use_mejc: bool = True,
+        mejc_phi_weight: float = 0.60,
+        mejc_d_mid_max_um: Optional[float] = 3.5,
+        mejc_min_prob: float = 0.005,
+        **kwargs,
     ):
         self.c_app = float(c_app)
         self.c_div = float(c_div)
@@ -246,6 +252,10 @@ class DuplicateParentTrackingSolver:
         self.min_daughter_divergence_angle_deg = min_daughter_divergence_angle_deg
         self.check_cleavage_divergence = check_cleavage_divergence
         self.daughter_cleavage_divergence_angle = daughter_cleavage_divergence_angle
+        self.use_mejc = bool(use_mejc)
+        self.mejc_phi_weight = float(mejc_phi_weight)
+        self.mejc_d_mid_max_um = float(mejc_d_mid_max_um) if mejc_d_mid_max_um is not None else None
+        self.mejc_min_prob = float(mejc_min_prob)
 
     def solve_frame_pair(
         self,
@@ -254,7 +264,8 @@ class DuplicateParentTrackingSolver:
         probabilities: np.ndarray,  # (N, M) in [0, 1]
     ) -> List[SolvedEdge]:
         """
-        Solves bipartite matching transition between frame t and t+1.
+        Solves frame association via Morality-Enforcing Joint Cytokinesis (MEJC)
+        or rectangular LAP with virtual division slots.
 
         Args:
             source_coords: (N, 3) array of (z, y, x) centroid coordinates at frame t.
@@ -279,29 +290,193 @@ class DuplicateParentTrackingSolver:
         # Sanitize probability matrix (handle NaNs and out-of-bounds values)
         probs = np.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
 
+        # 1. Try Morality-Enforcing Joint Cytokinesis (MEJC) ILP Solver first
+        if self.use_mejc:
+            mejc_edges = self._solve_frame_pair_mejc(src, tgt, probs, dist_matrix)
+            if mejc_edges is not None:
+                return mejc_edges
+
+        # 2. Fallback to rectangular LAP matching
+        return self._solve_frame_pair_lap(src, tgt, probs, dist_matrix)
+
+    def _solve_frame_pair_mejc(
+        self,
+        src: np.ndarray,
+        tgt: np.ndarray,
+        probs: np.ndarray,
+        dist_matrix: np.ndarray,
+    ) -> Optional[List[SolvedEdge]]:
+        """
+        Morality-Enforcing Joint Cytokinesis (MEJC) ILP Solver.
+        Solves joint bipartite assignment with biological cytokinesis hyper-edges
+        using 0-1 mixed-integer linear programming (MILP).
+        """
+        N, M = src.shape[0], tgt.shape[0]
+        v_scale = np.asarray(self.voxel_scale, dtype=np.float64)
+        src_phys = src * v_scale
+        tgt_phys = tgt * v_scale
+
+        # 1. Candidate continuation edges: prob > 0, dist <= r_max_um, w_cont > 0
+        mask_cont = (probs > 0.0) & (dist_matrix <= (self.r_max_um + 1e-6))
+        cont_pairs = np.argwhere(mask_cont)
+        if len(cont_pairs) == 0:
+            return []
+
+        cand_cont: List[Tuple[int, int, float, float]] = []
+        for i, j in cont_pairs:
+            p = float(probs[i, j])
+            d = float(dist_matrix[i, j])
+            w = p + self.c_app
+            if w > 0.0:
+                cand_cont.append((int(i), int(j), p, d))
+
+        n_cont = len(cand_cont)
+
+        # 2. Candidate division hyper-edges (i, (j, k)) with j < k
+        src_targets: Dict[int, List[int]] = {}
+        for i, j, p, d in cand_cont:
+            if d <= (self.max_parent_dist_um + 1e-6) and p >= self.mejc_min_prob:
+                src_targets.setdefault(i, []).append(j)
+
+        cand_div: List[Tuple[int, int, int, float, float, float, float, float]] = []
+        for i, targets in src_targets.items():
+            if len(targets) < 2:
+                continue
+            p_parent = src_phys[i]
+            for idx1 in range(len(targets)):
+                j = targets[idx1]
+                p_d1 = tgt_phys[j]
+                d1 = float(dist_matrix[i, j])
+                p1 = float(probs[i, j])
+                for idx2 in range(idx1 + 1, len(targets)):
+                    k = targets[idx2]
+                    p_d2 = tgt_phys[k]
+                    d2 = float(dist_matrix[i, k])
+                    p2 = float(probs[i, k])
+
+                    # Physical sister distance
+                    d_sister = float(np.linalg.norm(p_d1 - p_d2))
+                    if not ((self.min_sister_dist_um - 1e-6) <= d_sister <= (self.max_sister_dist_um + 1e-6)):
+                        continue
+
+                    # Bilateral symmetry
+                    tau = abs(d1 - d2) / (d1 + d2 + 1e-6)
+                    if self.max_sister_symmetry_tau is not None and tau > (self.max_sister_symmetry_tau + 1e-6):
+                        continue
+
+                    # Equatorial midpoint conservation
+                    p_mid = (p_d1 + p_d2) / 2.0
+                    d_mid = float(np.linalg.norm(p_mid - p_parent))
+                    if self.mejc_d_mid_max_um is not None and d_mid > (self.mejc_d_mid_max_um + 1e-6):
+                        continue
+
+                    # Cleavage furrow divergence angle
+                    w1 = p_d1 - p_parent
+                    w2 = p_d2 - p_parent
+                    norm1 = float(np.linalg.norm(w1))
+                    norm2 = float(np.linalg.norm(w2))
+                    cos_theta = 0.0
+                    if norm1 > 1e-6 and norm2 > 1e-6:
+                        cos_theta = float(np.dot(w1, w2) / (norm1 * norm2))
+                        cos_theta = float(np.clip(cos_theta, -1.0, 1.0))
+                    if self.max_cleavage_cos_angle is not None and cos_theta > (self.max_cleavage_cos_angle + 1e-6):
+                        continue
+
+                    # Continuous Fermi-Dirac cytokinesis biophysical potential
+                    psi_mid = float(np.exp(-0.5 * (d_mid / 2.5) ** 2))
+                    psi_sep = float(1.0 / (1.0 + np.exp(-(d_sister - 8.0) / 1.0)))
+                    psi_div = float((1.0 - cos_theta) / 2.0)
+                    psi_sym = float(np.exp(-0.5 * (tau / 0.60) ** 2))
+                    phi_spindle = psi_mid * psi_sep * psi_div * psi_sym
+
+                    # Joint division profit: W_div = P1 + P2 + 2*c_app - c_div + beta*phi
+                    w_div = (p1 + p2) + 2.0 * self.c_app - self.c_div + self.mejc_phi_weight * phi_spindle
+                    if w_div > 0.0:
+                        cand_div.append((i, j, k, w_div, p1, p2, d1, d2))
+
+        # If no candidate divisions exist, fallback to LAP
+        if len(cand_div) == 0:
+            return None
+
+        n_div = len(cand_div)
+        n_vars = n_cont + n_div
+
+        # Build sparse constraint matrix: shape (N + M, n_vars)
+        # Row 0..N-1: source constraint: sum x_ij + sum z_ijk <= 1
+        # Row N..N+M-1: target constraint: sum x_ij + sum z_ijk <= 1
+        rows: List[int] = []
+        cols: List[int] = []
+        data: List[float] = []
+
+        w_obj = np.zeros(n_vars, dtype=np.float64)
+        for e, (i, j, p, d) in enumerate(cand_cont):
+            rows.extend([i, N + j])
+            cols.extend([e, e])
+            data.extend([1.0, 1.0])
+            w_obj[e] = p + self.c_app
+
+        for d_idx, (i, j, k, w_div, p1, p2, d1, d2) in enumerate(cand_div):
+            var_idx = n_cont + d_idx
+            rows.extend([i, N + j, N + k])
+            cols.extend([var_idx, var_idx, var_idx])
+            data.extend([1.0, 1.0, 1.0])
+            w_obj[var_idx] = w_div
+
+        A = sp.csc_matrix((data, (rows, cols)), shape=(N + M, n_vars))
+        constraints = LinearConstraint(A, lb=np.zeros(N + M), ub=np.ones(N + M))
+        integrality = np.ones(n_vars)
+        bounds = Bounds(0.0, 1.0)
+
+        # Maximize profit by minimizing negative objective
+        res = milp(c=-w_obj, constraints=constraints, integrality=integrality, bounds=bounds)
+        if not res.success or res.x is None:
+            return None
+
+        sol = res.x
+        solved_edges: List[SolvedEdge] = []
+        for e in range(n_cont):
+            if sol[e] > 0.5:
+                i, j, p, d = cand_cont[e]
+                solved_edges.append(SolvedEdge(i, j, p, d, 0))
+
+        for d_idx in range(n_div):
+            if sol[n_cont + d_idx] > 0.5:
+                i, j, k, w_div, p1, p2, d1, d2 = cand_div[d_idx]
+                solved_edges.append(SolvedEdge(i, j, p1, d1, 1))
+                solved_edges.append(SolvedEdge(i, k, p2, d2, 1))
+
+        solved_edges.sort(key=lambda e: (e.source_idx, e.target_idx))
+        return solved_edges
+
+    def _solve_frame_pair_lap(
+        self,
+        src: np.ndarray,
+        tgt: np.ndarray,
+        probs: np.ndarray,
+        dist_matrix: np.ndarray,
+    ) -> List[SolvedEdge]:
+        """
+        Rectangular LAP solver with virtual division slots.
+        """
+        N = src.shape[0]
+        M = tgt.shape[0]
+
         # Primary slot profit: W1 = P + c_app
         # Virtual division slot profit: W2 = P + c_app - c_div
         w1_matrix = probs + self.c_app
         w2_matrix = probs + self.c_app - self.c_div
 
         # Cost matrix: shape (2N, M + 2N)
-        # Row 0..N-1:     Primary slot u_i^(1)
-        # Row N..2N-1:   Division slot u_i^(2)
-        # Col 0..M-1:     Real target cells v_j
-        # Col M..M+N-1:   Slack for primary slot i (cost 0.0)
-        # Col M+N..M+2N-1: Slack for division slot i (cost 0.0)
         BIG_COST = 1e6
         total_rows = 2 * N
         total_cols = M + 2 * N
         cost_matrix = np.full((total_rows, total_cols), BIG_COST, dtype=np.float64)
 
         # 1. Primary continuation slots (Row 0..N-1)
-        # Valid edge condition: prob > 0, w1 > 0, dist <= r_max_um
         mask1 = (probs > 0.0) & (w1_matrix > 0.0) & (dist_matrix <= (self.r_max_um + 1e-6))
         cost_matrix[:N, :M] = np.where(mask1, -w1_matrix, BIG_COST)
 
         # 2. Virtual division slots (Row N..2N-1)
-        # Valid edge condition: prob > 0, w2 > 0, dist <= max_parent_dist_um
         mask2 = (probs > 0.0) & (w2_matrix > 0.0) & (dist_matrix <= (self.max_parent_dist_um + 1e-6))
         cost_matrix[N:2*N, :M] = np.where(mask2, -w2_matrix, BIG_COST)
 
