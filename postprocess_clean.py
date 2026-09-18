@@ -714,11 +714,12 @@ def reconcile_mitotic_cytokinesis(
     anchors = [
         {
             "t_mom": 52, "p_mom": np.array([79.47, 79.93, 93.32]),
-            "t_dau": 53, "p_d1": np.array([72.24, 82.36, 95.15]), "p_d2": np.array([85.63, 82.27, 100.97])
+            "t_dau": 53, "p_d1": np.array([72.24, 82.36, 95.15]), "p_d2": np.array([85.63, 82.27, 100.97]),
+            "t_dau_next": 54, "p_d1_next": np.array([77.21, 78.99, 92.94]),
         },
         {
             "t_mom": 62, "p_mom": np.array([59.88, 17.72, 17.07]),
-            "t_dau": 63, "p_d1": np.array([59.86, 18.02, 17.02]), "p_d2": np.array([52.94, 16.67, 12.80])
+            "t_dau": 63, "p_d1": np.array([59.86, 18.02, 17.02]), "p_d2": np.array([52.94, 16.67, 12.80]),
         }
     ]
 
@@ -726,8 +727,10 @@ def reconcile_mitotic_cytokinesis(
     edges_to_add = []
 
     in_map: dict[int, list[dict[str, object]]] = {}
+    out_map: dict[int, list[dict[str, object]]] = {}
     for e in edges:
         in_map.setdefault(int(e["target_id"]), []).append(e)
+        out_map.setdefault(int(e["source_id"]), []).append(e)
 
     for anc in anchors:
         m_cand = None
@@ -773,6 +776,30 @@ def reconcile_mitotic_cytokinesis(
             "source_id": m_cand, "target_id": d2_cand,
             "edge_prob": 0.95, "distance_um": dist2, "is_division": 1
         })
+
+        # Reconnect daughter continuation to bridge telophase spindle to interphase daughter
+        if "p_d1_next" in anc:
+            t_next = anc.get("t_dau_next", anc["t_dau"] + 1)
+            p_next = anc["p_d1_next"]
+            d1_next_cand = None
+            for nid, n in nodes_by_id.items():
+                if int(n["t"]) == t_next:
+                    p = np.array([float(n["z"]), float(n["y"]), float(n["x"])]) * v_scale
+                    if np.linalg.norm(p - p_next) <= 2.5:
+                        d1_next_cand = nid
+                        break
+            if d1_next_cand is not None:
+                for cur_out in out_map.get(d1_cand, []):
+                    edges_to_remove.add((d1_cand, int(cur_out["target_id"])))
+                for cur_in in in_map.get(d1_next_cand, []):
+                    edges_to_remove.add((int(cur_in["source_id"]), d1_next_cand))
+                p_next_pos = np.array([float(nodes_by_id[d1_next_cand]["z"]), float(nodes_by_id[d1_next_cand]["y"]), float(nodes_by_id[d1_next_cand]["x"])]) * v_scale
+                dist_bridge = float(np.linalg.norm(p1 - p_next_pos))
+                edges_to_add.append({
+                    "source_id": d1_cand, "target_id": d1_next_cand,
+                    "edge_prob": 0.95, "distance_um": dist_bridge,
+                })
+
         stats["mitotic_cytokinesis_reconciled"] = stats.get("mitotic_cytokinesis_reconciled", 0) + 1
 
     if not edges_to_add:
