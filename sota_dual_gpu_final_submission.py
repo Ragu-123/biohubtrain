@@ -316,8 +316,8 @@ KINETIC_ALPHA              = 0.40                 # Quadratic kinetic stiffness 
 DET_THRESHOLD              = 0.96875
 POOL_KERNEL_UM             = 3.0
 EDGE_STRONG_THRESH         = 0.40
-EDGE_MIN_THRESH            = 0.15                 # Relaxed from 0.20 to 0.15 to admit distant candidates
-EDGE_TOPK_PARENTS          = 4                    # Expanded from 3 to 4 to recover candidate window drops
+EDGE_MIN_THRESH            = 0.05                 # Relaxed from 0.15 to 0.05 to preserve distant dividing daughter candidates
+EDGE_TOPK_PARENTS          = 6                    # Expanded from 4 to 6 to recover candidate window drops in dense clusters
 EDGE_MAX_DISTANCE_UM       = CANDIDATE_SEARCH_RADIUS_UM  # 25.0 um
 
 ILP_EDGE_WEIGHT            = -1.0
@@ -782,13 +782,17 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
     solver = DuplicateParentTrackingSolver(
         c_app=0.10,
         c_div=c_div,
-        min_sister_dist_um=8.0,
+        min_sister_dist_um=10.0 if mean_density < 250.0 else 7.5,
         max_sister_dist_um=params["div_sister_max_um"],
         max_parent_dist_um=params["div_parent_max_um"],
         max_sister_symmetry_tau=0.60,
         r_max_um=params.get("r_max_um", 25.0),
         voxel_scale=v_scale,
         max_cleavage_cos_angle=0.0,
+        use_mejc=True,
+        mejc_phi_weight=0.35,
+        mejc_d_mid_max_um=5.0,
+        mejc_min_prob=0.25 if mean_density < 250.0 else 0.005,
     )
 
     frame_node_indices: dict[int, list[int]] = {}

@@ -234,9 +234,9 @@ class DuplicateParentTrackingSolver:
         min_daughter_divergence_angle_deg: Optional[float] = None,
         check_cleavage_divergence: bool = False,
         daughter_cleavage_divergence_angle: Optional[float] = None,
-        use_mejc: bool = True,
-        mejc_phi_weight: float = 0.60,
-        mejc_d_mid_max_um: Optional[float] = 3.5,
+        use_mejc: bool = False,
+        mejc_phi_weight: float = 0.35,
+        mejc_d_mid_max_um: Optional[float] = 5.0,
         mejc_min_prob: float = 0.005,
         **kwargs,
     ):
@@ -342,6 +342,9 @@ class DuplicateParentTrackingSolver:
         for i, targets in src_targets.items():
             if len(targets) < 2:
                 continue
+            # Cap candidates per parent to top 8 by probability to bound combinatorial complexity
+            if len(targets) > 8:
+                targets = sorted(targets, key=lambda j: probs[i, j], reverse=True)[:8]
             p_parent = src_phys[i]
             for idx1 in range(len(targets)):
                 j = targets[idx1]
