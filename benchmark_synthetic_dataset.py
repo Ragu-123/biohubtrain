@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import argparse
+import json
 import numpy as np
 import polars as pl
 from typing import Dict, List, Tuple
@@ -166,9 +167,9 @@ def evaluate_sequence(
 def main():
     parser = argparse.ArgumentParser(description="Benchmark Synthetic 3D Cell Tracking Dataset")
     parser.add_argument("--data_dir", type=str, default="/kaggle/input/notebooks/josefreitasalvesneto/biohub-synthetic-dataset/biohub_synthetic/sequences")
-    parser.add_argument("--num_seqs", type=int, default=50, help="Number of sequences to evaluate")
+    parser.add_argument("--num_seqs", type=int, default=150, help="Number of sequences to evaluate")
     parser.add_argument("--c_div", type=float, default=0.20, help="Division cost threshold penalty")
-    parser.add_argument("--sigma_d", type=float, default=5.5, help="Dispersion scale parameter")
+    parser.add_argument("--sigma_d", type=float, default=6.5, help="Dispersion scale parameter")
     args = parser.parse_args()
 
     if not os.path.exists(args.data_dir):
@@ -293,6 +294,42 @@ def main():
     print(f"--------------------------------------------------")
     print(f"🏆 FINAL PROJECTED LEADERBOARD SCORE (150 VOLUMES): {final_150_score:.4f}")
     print("=" * 80)
+
+    # Save structured results
+    out_payload = {
+        "num_evaluated_sequences": num_to_eval,
+        "empirical_metrics": {
+            "edge_jaccard": micro_edge_j,
+            "edge_tp": tot_edge_tp,
+            "edge_fp": tot_edge_fp,
+            "edge_fn": tot_edge_fn,
+            "div_jaccard": micro_div_j,
+            "div_tp": tot_div_tp,
+            "div_fp": tot_div_fp,
+            "div_fn": tot_div_fn,
+            "score": measured_score,
+            "execution_time_seconds": total_time,
+        },
+        "projected_150_volumes": {
+            "scale_factor": scale_factor,
+            "projected_edge_tp": proj_edge_tp,
+            "projected_edge_fp": proj_edge_fp,
+            "projected_edge_fn": proj_edge_fn,
+            "projected_edge_jaccard": proj_edge_j,
+            "projected_div_tp": proj_div_tp,
+            "projected_div_fp": proj_div_fp,
+            "projected_div_fn": proj_div_fn,
+            "projected_div_jaccard": proj_div_j,
+            "projected_score": final_150_score,
+        },
+    }
+    out_path = "/kaggle/working/synthetic_benchmark_results.json"
+    try:
+        with open(out_path, "w") as f:
+            json.dump(out_payload, f, indent=2)
+        print(f"Saved benchmark summary to {out_path}")
+    except Exception as e:
+        print(f"Could not save json to {out_path}: {e}")
 
 if __name__ == "__main__":
     main()
