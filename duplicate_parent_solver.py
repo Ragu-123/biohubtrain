@@ -234,7 +234,7 @@ class DuplicateParentTrackingSolver:
         min_daughter_divergence_angle_deg: Optional[float] = None,
         check_cleavage_divergence: bool = False,
         daughter_cleavage_divergence_angle: Optional[float] = None,
-        use_mejc: bool = True,
+        use_mejc: bool = False,
         mejc_phi_weight: float = 0.65,
         mejc_d_mid_max_um: Optional[float] = 5.5,
         mejc_min_prob: float = 0.005,
