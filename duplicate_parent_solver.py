@@ -229,6 +229,10 @@ class DuplicateParentTrackingSolver:
         r_max_um: float = DEFAULT_R_MAX_UM,
         voxel_scale: Tuple[float, float, float] = VOXEL_SCALE_UM,
         max_sister_symmetry_tau: Optional[float] = None,
+        max_cleavage_cos_angle: Optional[float] = None,
+        min_daughter_divergence_angle_deg: Optional[float] = None,
+        check_cleavage_divergence: bool = False,
+        daughter_cleavage_divergence_angle: Optional[float] = None,
     ):
         self.c_app = float(c_app)
         self.c_div = float(c_div)
@@ -238,6 +242,10 @@ class DuplicateParentTrackingSolver:
         self.r_max_um = float(r_max_um)
         self.voxel_scale = (float(voxel_scale[0]), float(voxel_scale[1]), float(voxel_scale[2]))
         self.max_sister_symmetry_tau = max_sister_symmetry_tau
+        self.max_cleavage_cos_angle = max_cleavage_cos_angle
+        self.min_daughter_divergence_angle_deg = min_daughter_divergence_angle_deg
+        self.check_cleavage_divergence = check_cleavage_divergence
+        self.daughter_cleavage_divergence_angle = daughter_cleavage_divergence_angle
 
     def solve_frame_pair(
         self,
@@ -347,7 +355,45 @@ class DuplicateParentTrackingSolver:
                     tau = abs(d1 - d2) / (d1 + d2 + 1e-6)
                     is_symmetry_valid = (tau <= self.max_sister_symmetry_tau)
 
-                valid_division = is_sister_dist_valid and is_parent_dist_valid and is_symmetry_valid
+                # Daughter cleavage divergence angle check
+                is_divergence_valid = True
+                if (
+                    self.max_cleavage_cos_angle is not None
+                    or self.min_daughter_divergence_angle_deg is not None
+                    or self.check_cleavage_divergence
+                    or self.daughter_cleavage_divergence_angle is not None
+                ):
+                    v_scale = np.asarray(self.voxel_scale, dtype=np.float64)
+                    p_parent = src[src_idx] * v_scale
+                    p_d1 = tgt[t1] * v_scale
+                    p_d2 = tgt[t2] * v_scale
+                    w1 = p_d1 - p_parent
+                    w2 = p_d2 - p_parent
+                    norm1 = float(np.linalg.norm(w1))
+                    norm2 = float(np.linalg.norm(w2))
+                    if norm1 > 1e-6 and norm2 > 1e-6:
+                        cos_angle = float(np.dot(w1, w2) / (norm1 * norm2))
+                        cos_angle = float(np.clip(cos_angle, -1.0, 1.0))
+                        angle_deg = float(np.degrees(np.arccos(cos_angle)))
+
+                        max_cos = self.max_cleavage_cos_angle
+                        if max_cos is None and self.check_cleavage_divergence:
+                            max_cos = 0.0  # Diverging daughter paths: angle >= 90 deg
+                        if max_cos is not None and cos_angle > (max_cos + 1e-6):
+                            is_divergence_valid = False
+
+                        min_angle = self.min_daughter_divergence_angle_deg
+                        if min_angle is None and self.daughter_cleavage_divergence_angle is not None:
+                            min_angle = float(self.daughter_cleavage_divergence_angle)
+                        if min_angle is not None and angle_deg < (min_angle - 1e-6):
+                            is_divergence_valid = False
+
+                valid_division = (
+                    is_sister_dist_valid
+                    and is_parent_dist_valid
+                    and is_symmetry_valid
+                    and is_divergence_valid
+                )
 
                 if valid_division:
                     # Validated biological division: retain both daughter edges
@@ -596,6 +642,11 @@ class ReferenceDuplicateParentSolver(DuplicateParentTrackingSolver):
         r_max_um: float = DEFAULT_R_MAX_UM,
         voxel_scale: Tuple[float, float, float] = VOXEL_SCALE_UM,
         max_sister_symmetry_tau: Optional[float] = None,
+        max_cleavage_cos_angle: Optional[float] = None,
+        min_daughter_divergence_angle_deg: Optional[float] = None,
+        check_cleavage_divergence: bool = False,
+        daughter_cleavage_divergence_angle: Optional[float] = None,
+        **kwargs,
     ):
         super().__init__(
             c_app=c_app,
@@ -606,6 +657,11 @@ class ReferenceDuplicateParentSolver(DuplicateParentTrackingSolver):
             r_max_um=r_max_um,
             voxel_scale=voxel_scale,
             max_sister_symmetry_tau=max_sister_symmetry_tau,
+            max_cleavage_cos_angle=max_cleavage_cos_angle,
+            min_daughter_divergence_angle_deg=min_daughter_divergence_angle_deg,
+            check_cleavage_divergence=check_cleavage_divergence,
+            daughter_cleavage_divergence_angle=daughter_cleavage_divergence_angle,
+            **kwargs,
         )
 
 

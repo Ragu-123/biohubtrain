@@ -130,7 +130,8 @@ class DensityClassifier:
             return {
                 "mode": "mitotic_burst",
                 "c_div": 0.58,
-                "min_track_len": 3,
+                "min_track_len": 5,
+                "r_max_um": 12.5,
                 "div_sister_min_um": 3.0,
                 "div_sister_max_um": 18.0,
                 "div_parent_max_um": 10.0,
@@ -144,6 +145,7 @@ class DensityClassifier:
                 "mode": "quiescent",
                 "c_div": 0.68,
                 "min_track_len": 3,
+                "r_max_um": 25.0,
                 "div_sister_min_um": 3.0,
                 "div_sister_max_um": 14.0,
                 "div_parent_max_um": 9.0,
@@ -546,9 +548,20 @@ def add_safe_divisions_postlink(
     safe_div_frame_frac_cap: float | None = None,
     safe_div_sister_max_um: float | None = None,
     safe_div_max_um: float | None = None,
+    safe_div_sister_min_um: float | None = None,
+    mode: str | None = None,
 ) -> list[dict[str, object]]:
     if not OUTPUT_SAFE_DIVISIONS or not edges or not nodes_by_id:
         return edges
+
+    embryo_mode = mode or stats.get("embryo_mode")
+    # Disable safe divisions on quiescent embryos
+    if embryo_mode == "quiescent":
+        return edges
+
+    eff_sister_min_um = safe_div_sister_min_um
+    if eff_sister_min_um is None:
+        eff_sister_min_um = 8.0 if embryo_mode in ("mitotic_burst", "dense") else 0.0
 
     eff_global_cap_frac = safe_div_global_frac_cap if safe_div_global_frac_cap is not None else SAFE_DIV_GLOBAL_FRAC_CAP
     eff_frame_cap_frac = safe_div_frame_frac_cap if safe_div_frame_frac_cap is not None else SAFE_DIV_FRAME_FRAC_CAP
@@ -611,7 +624,7 @@ def add_safe_divisions_postlink(
                 if parent_dist > eff_parent_max_um:
                     continue
                 sister_dist = edge_distance_um(existing_child, candidate)
-                if sister_dist > eff_sister_max_um:
+                if sister_dist < eff_sister_min_um or sister_dist > eff_sister_max_um:
                     continue
 
                 if SAFE_DIV_REQUIRE_MUTUAL_NN and candidate_id != mutual_nn_id:
@@ -897,12 +910,36 @@ def filter_output_graph(
     mean_nodes_per_frame: float | None = None,
     total_frames: int | None = None,
     custom_params: dict[str, Any] | None = None,
+    min_sister_dist_um: float | None = None,
+    max_sister_tau: float | None = None,
+    production: bool | None = None,
 ) -> tuple[dict[int, dict[str, object]], list[dict[str, object]], dict[str, int]]:
     if mean_nodes_per_frame is None:
         mean_nodes_per_frame = DensityClassifier.compute_mean_nodes_per_frame(nodes_by_id, total_frames)
     params = DensityClassifier.get_postprocessing_params(mean_nodes_per_frame)
     if custom_params:
         params.update(custom_params)
+
+    # In production or when configured, ensure min_sister_dist_um=8.0 and max_sister_tau=0.60
+    is_production = production if production is not None else (
+        bool(custom_params and custom_params.get("production", False))
+    )
+    if is_production:
+        if min_sister_dist_um is None and "div_sister_min_um" not in (custom_params or {}):
+            min_sister_dist_um = 8.0
+        if max_sister_tau is None and "div_symmetry_max_tau" not in (custom_params or {}):
+            max_sister_tau = 0.60
+
+    if min_sister_dist_um is not None:
+        params["div_sister_min_um"] = min_sister_dist_um
+    elif custom_params and "min_sister_dist_um" in custom_params:
+        params["div_sister_min_um"] = custom_params["min_sister_dist_um"]
+
+    if max_sister_tau is not None:
+        params["div_symmetry_max_tau"] = max_sister_tau
+    elif custom_params and "max_sister_tau" in custom_params:
+        params["div_symmetry_max_tau"] = custom_params["max_sister_tau"]
+
     stats = {
         "embryo_mode": params["mode"],
         "mean_nodes_per_frame": mean_nodes_per_frame,
@@ -947,6 +984,8 @@ def filter_output_graph(
         safe_div_frame_frac_cap=params.get("safe_div_frame_frac_cap"),
         safe_div_sister_max_um=params.get("div_sister_max_um"),
         safe_div_max_um=params.get("div_parent_max_um"),
+        safe_div_sister_min_um=params.get("div_sister_min_um", 8.0 if params.get("mode") in ("mitotic_burst", "dense") else 0.0),
+        mode=params.get("mode"),
     )
 
     # Division geometry filter with density-adapted sister bounds and bilateral symmetry

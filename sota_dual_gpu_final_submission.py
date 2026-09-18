@@ -331,6 +331,9 @@ def detect_and_refine_peaks(prob_map: torch.Tensor, t: int, threshold: float, po
     3D Continuous Sub-Voxel Peak Detection & Parabolic Fitting.
     Eliminates centroid quantization lattice errors across anisotropic Z and 4x downsampled XY.
     """
+    # Enforce strict float32 precision for continuous parabolic sub-voxel refinement
+    prob_map = prob_map.float()
+
     # Normalize tensor shape to exactly (1, 1, Z, Y, X)
     while prob_map.ndim < 5:
         prob_map = prob_map.unsqueeze(0)
@@ -454,7 +457,9 @@ def apply_kinematics(
         else:
             kine_mult = 1.0
 
-        p_mod = float(p * ((1.0 - beta_kine) + beta_kine * kine_mult))
+        # Centered kinematic modulation
+        kine_weight = float(np.clip(1.0 + beta_kine * (kine_mult - 0.50), 0.60, 1.25))
+        p_mod = float(p * kine_weight)
         modulated.append((gi, gj, p_mod, dist))
     return modulated
 
@@ -551,12 +556,23 @@ def compute_anisotropic_candidates_with_smooth_potential(
     for si, tj in strong:
         cand_pairs.add((int(si), int(tj)))
 
-    k = min(top_k, n_src)
+    # Bidirectional candidate queries:
+    # (a) Top-k sources for each target cell tj (backward query)
+    k_src = min(top_k, n_src)
     for tj in range(n_tgt):
         col_p = p_ens[:, tj]
-        top_sources = np.argpartition(col_p, -k)[-k:] if k < n_src else np.arange(n_src)
+        top_sources = np.argpartition(col_p, -k_src)[-k_src:] if k_src < n_src else np.arange(n_src)
         for si in top_sources:
             if float(col_p[si]) >= min_thresh:
+                cand_pairs.add((int(si), int(tj)))
+
+    # (b) Top-k targets for each source cell si (forward query)
+    k_tgt = min(top_k, n_tgt)
+    for si in range(n_src):
+        row_p = p_ens[si, :]
+        top_targets = np.argpartition(row_p, -k_tgt)[-k_tgt:] if k_tgt < n_tgt else np.arange(n_tgt)
+        for tj in top_targets:
+            if float(row_p[tj]) >= min_thresh:
                 cand_pairs.add((int(si), int(tj)))
 
     # 2. Vectorized metric tensor evaluation and smooth energy penalty
@@ -627,25 +643,37 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
     global_node_count = 0
     candidate_edges = []
 
-    for ws in window_starts:
+    for ws_idx, ws in enumerate(window_starts):
         frame_indices = list(range(ws, ws + window_size))
         imgs = torch.stack([_load_frame(zarr_arr, t, target_shape, downsample) for t in frame_indices])
         imgs = ((imgs - q_low) / (q_high - q_low + 1e-6)).clamp(0.0).unsqueeze(0).to(device)
 
-        out0, det0 = m0.encode(imgs)
-        out1, det1 = m1.encode(imgs)
+        # Wrap 3D UNet encoding in torch.autocast(device_type="cuda", dtype=torch.float16)
+        use_cuda = (device.type == "cuda")
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_cuda):
+            out0, det0 = m0.encode(imgs)
+            out1, det1 = m1.encode(imgs)
 
-        # 4-fold Flip-XY TTA
-        for dims in [(-1,), (-2,), (-2, -1)]:
-            imgs_flip = imgs.flip(dims)
-            _, d0_flip = m0.encode(imgs_flip)
-            _, d1_flip = m1.encode(imgs_flip)
-            for f in range(window_size):
-                det0[f] = det0[f] + d0_flip[f].flip(dims)
-                det1[f] = det1[f] + d1_flip[f].flip(dims)
-            del imgs_flip, d0_flip, d1_flip
+            # 4-fold Flip-XY TTA
+            for dims in [(-1,), (-2,), (-2, -1)]:
+                imgs_flip = imgs.flip(dims)
+                _, d0_flip = m0.encode(imgs_flip)
+                _, d1_flip = m1.encode(imgs_flip)
+                for f in range(window_size):
+                    det0[f] = det0[f] + d0_flip[f].flip(dims)
+                    det1[f] = det1[f] + d1_flip[f].flip(dims)
+                del imgs_flip, d0_flip, d1_flip
 
-        det_fused = [(det0[f] + det1[f]) / 8.0 for f in range(window_size)]
+        # Float32 peak refinement: convert fused heatmaps to float32
+        det_fused = [(det0[f].float() + det1[f].float()) / 8.0 for f in range(window_size)]
+
+        # Sliding-window keepalive heartbeats every 10 windows
+        if (ws_idx + 1) % 10 == 0 or (ws_idx + 1) == len(window_starts):
+            print(
+                f"[{device}] {stem}: window {ws_idx + 1}/{len(window_starts)} "
+                f"(frames {ws}..{min(ws + window_size - 1, T - 1)}) processed | keepalive heartbeat",
+                flush=True,
+            )
 
         for f_idx, t in enumerate(frame_indices):
             if t not in seen_frames:
@@ -754,12 +782,13 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
     solver = DuplicateParentTrackingSolver(
         c_app=0.10,
         c_div=c_div,
-        min_sister_dist_um=params["div_sister_min_um"],
+        min_sister_dist_um=8.0,
         max_sister_dist_um=params["div_sister_max_um"],
         max_parent_dist_um=params["div_parent_max_um"],
-        max_sister_symmetry_tau=params.get("div_symmetry_max_tau", 0.40),
-        r_max_um=25.0,
+        max_sister_symmetry_tau=0.60,
+        r_max_um=params.get("r_max_um", 25.0),
         voxel_scale=v_scale,
+        max_cleavage_cos_angle=0.0,
     )
 
     frame_node_indices: dict[int, list[int]] = {}
@@ -818,11 +847,24 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
     filt_nodes, filt_edges, stats = filter_output_graph(
         nodes_by_id, raw_edges, dataset=stem,
         mean_nodes_per_frame=mean_density, total_frames=total_frames,
+        min_sister_dist_um=8.0, max_sister_tau=0.60, production=True,
     )
     dt = time.time() - t0
     pruned = len(nodes_by_id) - len(filt_nodes)
     print(f"[{device}] Finished {stem} in {dt:.1f}s: {len(filt_nodes)} nodes, {len(filt_edges)} edges (pruned {pruned} noisy nodes, recovered {stats.get('gap_closed_single', 0) + stats.get('gap2_recovered', 0)} gap edges).", flush=True)
-    return stem, filt_nodes, filt_edges
+    vol_metrics = {
+        "dataset": stem,
+        "runtime_seconds": round(dt, 2),
+        "raw_nodes": len(coords_orig),
+        "raw_candidate_edges": len(candidate_edges),
+        "solved_raw_edges": len(raw_edges),
+        "filtered_nodes": len(filt_nodes),
+        "filtered_edges": len(filt_edges),
+        "pruned_noisy_nodes": pruned,
+        "mean_density": round(float(mean_density), 2),
+        "mode": params.get("mode", "unknown"),
+    }
+    return stem, filt_nodes, filt_edges, vol_metrics
 
 
 def gpu_worker(gpu_id: int, task_source, return_dict):
@@ -855,7 +897,8 @@ def build_submission_dataframe(all_results):
     all_results = sorted(all_results, key=lambda x: x[0])
     dfs = []
     seen_stems = set()
-    for stem, filt_nodes, filt_edges in all_results:
+    for item in all_results:
+        stem, filt_nodes, filt_edges = item[0], item[1], item[2]
         if stem in seen_stems:
             print(f"Skipping duplicate result for {stem}", flush=True)
             continue
@@ -984,6 +1027,36 @@ def main():
     OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
     sub_df.write_csv(OUTPUT_CSV)
     elapsed = time.time() - start_time
+
+    # Persistent latency benchmark
+    per_vol_stats = []
+    for item in all_results:
+        if len(item) >= 4 and isinstance(item[3], dict):
+            per_vol_stats.append(item[3])
+        else:
+            per_vol_stats.append({
+                "dataset": item[0],
+                "nodes": len(item[1]),
+                "edges": len(item[2]),
+            })
+
+    benchmark_data = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "total_elapsed_seconds": round(elapsed, 2),
+        "total_elapsed_minutes": round(elapsed / 60.0, 2),
+        "gpus_available": n_gpus,
+        "volumes_processed": len(all_results),
+        "total_submission_rows": sub_df.height,
+        "per_volume_metrics": per_vol_stats,
+    }
+    for b_path in [Path("latency_benchmark.json"), OUTPUT_CSV.parent / "latency_benchmark.json"]:
+        try:
+            b_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(b_path, "w") as f:
+                json.dump(benchmark_data, f, indent=2)
+            print(f"📊 Persistent latency benchmark saved: {b_path}", flush=True)
+        except Exception as e:
+            print(f"Warning: could not write benchmark to {b_path}: {e}", flush=True)
 
     print("\n=================================================================")
     print(f"✅ SUBMISSION GENERATED SUCCESSFULLY in {elapsed:.1f}s ({elapsed/60:.2f} mins)!")
