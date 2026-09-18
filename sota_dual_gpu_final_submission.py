@@ -826,6 +826,11 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
                 prob_mat[si, tj] = max(prob_mat[si, tj], float(p))
 
         solved = solver.solve_frame_pair(src_vox, tgt_vox, prob_mat)
+        if t_src in (24, 52, 62):
+            divs = [e for e in solved if e.is_division == 1]
+            print(f"[DEBUG t={t_src}] solver returned {len(solved)} edges, {len(divs)} division edges:", flush=True)
+            for d in divs:
+                print(f"   div: {src_nids[d.source_idx]} -> {tgt_nids[d.target_idx]} prob={d.prob:.3f} dist={d.distance_um:.2f}um", flush=True)
         for e in solved:
             raw_edges.append({
                 "source_id": src_nids[e.source_idx],

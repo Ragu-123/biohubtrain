@@ -387,7 +387,7 @@ class DuplicateParentTrackingSolver:
                         continue
 
                     # Continuous Fermi-Dirac cytokinesis biophysical potential
-                    psi_mid = float(np.exp(-0.5 * (d_mid / 2.5) ** 2))
+                    psi_mid = float(np.exp(-0.5 * (d_mid / 4.5) ** 2))
                     psi_sep = float(1.0 / (1.0 + np.exp(-(d_sister - 8.0) / 1.0)))
                     psi_div = float((1.0 - cos_theta) / 2.0)
                     psi_sym = float(np.exp(-0.5 * (tau / 0.95) ** 2))

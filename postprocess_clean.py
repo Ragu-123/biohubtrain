@@ -134,7 +134,7 @@ class DensityClassifier:
                 "r_max_um": 12.5,
                 "div_sister_min_um": 3.0,
                 "div_sister_max_um": 18.0,
-                "div_parent_max_um": 10.0,
+                "div_parent_max_um": 10.5,
                 "div_symmetry_max_tau": 0.96,
                 "safe_div_global_frac_cap": 0.0050,
                 "safe_div_frame_frac_cap": 0.0100,
