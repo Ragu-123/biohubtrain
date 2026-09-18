@@ -316,7 +316,7 @@ KINETIC_ALPHA              = 0.40                 # Quadratic kinetic stiffness 
 DET_THRESHOLD              = 0.96875
 POOL_KERNEL_UM             = 3.0
 EDGE_STRONG_THRESH         = 0.40
-EDGE_MIN_THRESH            = 0.010                # Relaxed from 0.05 to 0.010 to preserve distant dividing daughter candidates
+EDGE_MIN_THRESH            = 0.05                 # Clean threshold suppresses spurious noise edges (p < 0.05)
 EDGE_TOPK_PARENTS          = 6                    # Expanded from 4 to 6 to recover candidate window drops in dense clusters
 EDGE_MAX_DISTANCE_UM       = CANDIDATE_SEARCH_RADIUS_UM  # 25.0 um
 
