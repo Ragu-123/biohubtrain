@@ -646,24 +646,6 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
 
         det_fused = [(det0[f] + det1[f]) / 8.0 for f in range(window_size)]
 
-        # --- 3D ANISOTROPIC PHYSICAL LAPLACIAN CLEAVAGE FURROW NOTCH ---
-        lap_k = torch.zeros((1, 1, 3, 3, 3), dtype=torch.float32, device=device)
-        lap_k[0, 0, 1, 1, 1] = -24.994083
-        lap_k[0, 0, 0, 1, 1] = 0.378698
-        lap_k[0, 0, 2, 1, 1] = 0.378698
-        lap_k[0, 0, 1, 0, 1] = 6.059172
-        lap_k[0, 0, 1, 2, 1] = 6.059172
-        lap_k[0, 0, 1, 1, 0] = 6.059172
-        lap_k[0, 0, 1, 1, 2] = 6.059172
-
-        for f in range(window_size):
-            frame_img = imgs[:, f:f+1]  # (1, 1, Z, Y, X)
-            lap_resp = F.conv3d(frame_img, lap_k, padding=1)
-            lap_furrow = F.relu(lap_resp / 24.994083)
-            if lap_furrow.shape[2:] != det_fused[f].shape[2:]:
-                lap_furrow = F.interpolate(lap_furrow, size=det_fused[f].shape[2:], mode="trilinear", align_corners=False)
-            det_fused[f] = det_fused[f] - 2.50 * lap_furrow
-
         for f_idx, t in enumerate(frame_indices):
             if t not in seen_frames:
                 arr = detect_and_refine_peaks(det_fused[f_idx][0], t, DET_THRESHOLD, pool_k)
@@ -726,15 +708,10 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
             pos_src_um = c_src[:, 1:].astype(np.float32) * voxel_size_um
             pos_tgt_um = c_tgt[:, 1:].astype(np.float32) * voxel_size_um
 
-            # Compute continuous tissue flow advection prior between frames
-            flow_disp = compute_continuous_tissue_flow(imgs[:, f_idx:f_idx+1], imgs[:, f_idx+1:f_idx+2])
-            u_src_vox = trilinear_sample_displacement_np(flow_disp, c_src[:, 1:])
-            u_src_um = u_src_vox * voxel_size_um
-
-            # Generate candidate edges with anisotropic metric tensor, flow advection, and smooth kinetic potential
+            # Generate candidate edges with physical anisotropic metric tensor and smooth kinetic potential
             cand_edges = compute_anisotropic_candidates_with_smooth_potential(
                 pos_src_um, pos_tgt_um, p_ens,
-                flow_src_um=u_src_um,
+                flow_src_um=None,
                 strong_thresh=EDGE_STRONG_THRESH,
                 min_thresh=EDGE_MIN_THRESH,
                 top_k=EDGE_TOPK_PARENTS,
@@ -769,15 +746,17 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
     t_solver = time.time()
     total_frames = max((int(c[0]) for c in coords_orig), default=0) + 1 if len(coords_orig) else 100
     mean_density = len(coords_orig) / max(total_frames, 1)
-    c_div = float(os.environ.get("BIOHUB_C_DIV", "1.20"))
+    params = DensityClassifier.get_postprocessing_params(mean_density)
+    c_div = float(os.environ.get("BIOHUB_C_DIV", str(params["c_div"])))
 
     v_scale = tuple(float(s) for s in scale) if hasattr(scale, "__iter__") else VOXEL_SCALE_UM
     solver = DuplicateParentTrackingSolver(
         c_app=0.10,
         c_div=c_div,
-        min_sister_dist_um=3.0,
-        max_sister_dist_um=18.0,
-        max_parent_dist_um=10.0,
+        min_sister_dist_um=params["div_sister_min_um"],
+        max_sister_dist_um=params["div_sister_max_um"],
+        max_parent_dist_um=params["div_parent_max_um"],
+        max_sister_symmetry_tau=params.get("div_symmetry_max_tau", 0.40),
         r_max_um=25.0,
         voxel_scale=v_scale,
     )

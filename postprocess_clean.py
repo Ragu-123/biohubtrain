@@ -50,7 +50,7 @@ GAP2_INSERT_SYNTHETIC = False  # Dual-graph pattern: internal protection only
 OUTPUT_SAFE_DIVISIONS = True
 SAFE_DIV_MAX_UM = 10.0
 SAFE_DIV_SISTER_MAX_UM = 18.0
-SAFE_DIV_SISTER_SYMMETRY_TAU = 0.85
+SAFE_DIV_SISTER_SYMMETRY_TAU = 0.40  # Tightened from 0.85 to enforce cytokinesis bilateral symmetry
 SAFE_DIV_DIVERGE_UM = 2.25
 SAFE_DIV_EXISTING_CHILD_MAX_UM = 10.0
 SAFE_DIV_FRAME_FRAC_CAP = 0.0010
@@ -62,6 +62,7 @@ OUTPUT_DIVISION_GEOMETRY_FILTER = True
 DIV_PARENT_MAX_UM = 10.0
 DIV_SISTER_MIN_UM = 3.0               # Lower cytokinesis bound (suppresses duplicate detections)
 DIV_SISTER_MAX_UM = 18.0              # Upper cytokinesis bound (synchronized with M3 solver: was 14.0)
+DIV_SYMMETRY_MAX_TAU = 0.40           # Cytokinesis bilateral symmetry gate: |d1 - d2| / (d1 + d2) <= 0.40
 DIV_DROP_TO_SINGLE_IF_BAD = True
 
 OUTPUT_FILTER_SHORT_TRACKS = True
@@ -133,6 +134,7 @@ class DensityClassifier:
                 "div_sister_min_um": 3.0,
                 "div_sister_max_um": 18.0,
                 "div_parent_max_um": 10.0,
+                "div_symmetry_max_tau": 0.40,
                 "safe_div_global_frac_cap": 0.0050,
                 "safe_div_frame_frac_cap": 0.0100,
                 "enable_boundary_protection": True,
@@ -145,6 +147,7 @@ class DensityClassifier:
                 "div_sister_min_um": 3.0,
                 "div_sister_max_um": 14.0,
                 "div_parent_max_um": 9.0,
+                "div_symmetry_max_tau": 0.40,
                 "safe_div_global_frac_cap": 0.0020,
                 "safe_div_frame_frac_cap": 0.0050,
                 "enable_boundary_protection": True,
@@ -635,9 +638,9 @@ def add_safe_divisions_postlink(
                         stats["safe_division_divergence_rejected"] = stats.get("safe_division_divergence_rejected", 0) + 1
                         continue
 
-                # Sister symmetry precision gate (tau <= 0.60)
+                # Sister symmetry precision gate (tau <= 0.40)
                 if SAFE_DIV_SISTER_SYMMETRY_TAU > 0.0:
-                    _sym_denom = max((child_dist + parent_dist) / 2.0, 1e-6)
+                    _sym_denom = max(child_dist + parent_dist, 1e-6)
                     if abs(child_dist - parent_dist) / _sym_denom > SAFE_DIV_SISTER_SYMMETRY_TAU:
                         stats["safe_division_symmetry_rejected"] = stats.get("safe_division_symmetry_rejected", 0) + 1
                         continue
@@ -946,10 +949,11 @@ def filter_output_graph(
         safe_div_max_um=params.get("div_parent_max_um"),
     )
 
-    # Division geometry filter with density-adapted sister bounds
+    # Division geometry filter with density-adapted sister bounds and bilateral symmetry
     div_parent_max = params.get("div_parent_max_um", DIV_PARENT_MAX_UM)
     div_sister_min = params.get("div_sister_min_um", DIV_SISTER_MIN_UM)
     div_sister_max = params.get("div_sister_max_um", DIV_SISTER_MAX_UM)
+    div_symmetry_max = params.get("div_symmetry_max_tau", DIV_SYMMETRY_MAX_TAU)
 
     if OUTPUT_DIVISION_GEOMETRY_FILTER and edges:
         by_source = {}
@@ -966,9 +970,12 @@ def filter_output_graph(
             n1 = nodes_by_id.get(int(top1["target_id"]))
             n2 = nodes_by_id.get(int(top2["target_id"]))
             sister = edge_distance_um(n1, n2) if (n1 and n2) else 999.0
+            denom = d1 + d2
+            tau = abs(d1 - d2) / denom if denom > 1e-6 else 0.0
             valid_cytokinesis = (
                 max(d1, d2) <= div_parent_max
                 and (div_sister_min <= sister <= div_sister_max)
+                and (tau <= div_symmetry_max)
             )
             if valid_cytokinesis:
                 filtered.extend([top1, top2])
