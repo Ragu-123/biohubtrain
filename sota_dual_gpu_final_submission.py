@@ -316,7 +316,7 @@ KINETIC_ALPHA              = 0.40                 # Quadratic kinetic stiffness 
 DET_THRESHOLD              = 0.96875
 POOL_KERNEL_UM             = 3.0
 EDGE_STRONG_THRESH         = 0.40
-EDGE_MIN_THRESH            = 0.05                 # Clean threshold suppresses spurious noise edges (p < 0.05)
+EDGE_MIN_THRESH            = 0.010                # Allows extending division daughters (p >= 0.010) into MEJC
 EDGE_TOPK_PARENTS          = 6                    # Expanded from 4 to 6 to recover candidate window drops in dense clusters
 EDGE_MAX_DISTANCE_UM       = CANDIDATE_SEARCH_RADIUS_UM  # 25.0 um
 
@@ -784,13 +784,13 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
         c_div=c_div,
         min_sister_dist_um=10.0 if mean_density < 250.0 else 7.5,
         max_sister_dist_um=params["div_sister_max_um"],
-        max_parent_dist_um=params["div_parent_max_um"],
+        max_parent_dist_um=10.5,
         max_sister_symmetry_tau=0.96,
         r_max_um=params.get("r_max_um", 25.0),
         voxel_scale=v_scale,
         max_cleavage_cos_angle=0.15,
         use_mejc=True,
-        mejc_phi_weight=0.35,
+        mejc_phi_weight=0.65,
         mejc_d_mid_max_um=5.5,
         mejc_min_prob=0.25 if mean_density < 250.0 else 0.005,
     )

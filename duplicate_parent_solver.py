@@ -235,7 +235,7 @@ class DuplicateParentTrackingSolver:
         check_cleavage_divergence: bool = False,
         daughter_cleavage_divergence_angle: Optional[float] = None,
         use_mejc: bool = True,
-        mejc_phi_weight: float = 0.35,
+        mejc_phi_weight: float = 0.65,
         mejc_d_mid_max_um: Optional[float] = 5.5,
         mejc_min_prob: float = 0.005,
         **kwargs,
@@ -317,10 +317,9 @@ class DuplicateParentTrackingSolver:
         tgt_phys = tgt * v_scale
 
         # 1. Candidate continuation edges: prob > 0, dist <= r_max_um, w_cont > 0
-        mask_cont = (probs > 0.0) & (dist_matrix <= (self.r_max_um + 1e-6))
+        # 1. Candidate continuation edges: prob >= 0.05, dist <= r_max_um, w_cont > 0
+        mask_cont = (probs >= 0.05) & (dist_matrix <= (self.r_max_um + 1e-6))
         cont_pairs = np.argwhere(mask_cont)
-        if len(cont_pairs) == 0:
-            return []
 
         cand_cont: List[Tuple[int, int, float, float]] = []
         for i, j in cont_pairs:
@@ -333,10 +332,12 @@ class DuplicateParentTrackingSolver:
         n_cont = len(cand_cont)
 
         # 2. Candidate division hyper-edges (i, (j, k)) with j < k
+        # Gated on physical parent distance and biological cytokinesis threshold
+        mask_div = (probs >= self.mejc_min_prob) & (dist_matrix <= (self.max_parent_dist_um + 1e-6))
+        div_pairs = np.argwhere(mask_div)
         src_targets: Dict[int, List[int]] = {}
-        for i, j, p, d in cand_cont:
-            if d <= (self.max_parent_dist_um + 1e-6) and p >= self.mejc_min_prob:
-                src_targets.setdefault(i, []).append(j)
+        for i, j in div_pairs:
+            src_targets.setdefault(int(i), []).append(int(j))
 
         cand_div: List[Tuple[int, int, int, float, float, float, float, float]] = []
         for i, targets in src_targets.items():
