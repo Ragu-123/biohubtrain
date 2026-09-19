@@ -1,4 +1,4 @@
-"""
+﻿"""
 Production-grade SOTA Post-Processing Module for Biohub Cell Tracking
 Contains:
 1. Candidate edge filtering & single-parent resolution
@@ -99,6 +99,7 @@ SHORT_TRACK_RESCUE_MIN_MEAN_EDGE_PROB = 0.88
 SHORT_TRACK_RESCUE_MAX_MEAN_EDGE_DIST_UM = 3.0
 SHORT_TRACK_RESCUE_MAX_NODES_FRAC = 0.012
 SHORT_TRACK_RESCUE_MAX_NODES_ABS = 120
+OUTPUT_SAFE_DIVISIONS = True
 SHORT_TRACK_RESCUE_TRIGGER_REMOVED_FRAC = 0.10
 
 OUTPUT_LINEFIT_SMOOTH = True
