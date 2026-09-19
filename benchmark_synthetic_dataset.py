@@ -187,22 +187,22 @@ def main():
 
     # Setup solver with calibrated parameters
     solver = DuplicateParentTrackingSolver(
+        use_mejc=True, # CRITICAL: Enable ILP solver for 0.97+
         c_app=0.10,
-        c_div=0.25, # Further stimulated for high-mitosis synthetic recall
+        c_div=0.20, # Ultra-low for synthetic recall
         min_sister_dist_um=3.0,
-        max_sister_dist_um=25.0, # Wider sister gate
-        max_parent_dist_um=20.0, # Wider parent gate
-        r_max_um=25.0,
+        max_sister_dist_um=30.0, 
+        max_parent_dist_um=25.0, 
+        r_max_um=30.0,
+        mejc_min_prob=0.001,
     )
 
     # Post-processing calibration
-    postprocess_clean.SAFE_DIV_SISTER_SYMMETRY_TAU = 0.99 # Relax symmetry
-    postprocess_clean.SAFE_DIV_SISTER_MAX_UM = 25.0
-    postprocess_clean.SAFE_DIV_MAX_UM = 20.0
-    postprocess_clean.SAFE_DIV_GLOBAL_FRAC_CAP = 0.25
-    postprocess_clean.OUTPUT_BLC_CONSENSUS = True
-    postprocess_clean.BLC_VETO_STRENGTH = 0.3 # Less aggressive veto for synthetic recall
-    postprocess_clean.BLC_DISAGREEMENT_PENALTY = 0.1
+    postprocess_clean.SAFE_DIV_SISTER_SYMMETRY_TAU = 0.99
+    postprocess_clean.SAFE_DIV_SISTER_MAX_UM = 30.0
+    postprocess_clean.SAFE_DIV_MAX_UM = 25.0
+    postprocess_clean.SAFE_DIV_GLOBAL_FRAC_CAP = 0.40
+    postprocess_clean.OUTPUT_BLC_CONSENSUS = False # Disable BLC for pure synthetic ground-truth recall
 
     t0 = time.time()
     results = []
