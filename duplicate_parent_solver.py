@@ -733,19 +733,19 @@ class DuplicateParentTrackingSolver:
                     # Lambda is lower in dense regions to avoid swaps, higher in sparse regions
                     lam = lambda_momentum
                     if hasattr(self, 'ADAPTIVE_LAMBDA') and self.ADAPTIVE_LAMBDA:
+                        lam = lambda_momentum
                         if N_curr > 1:
-                        from scipy.spatial import cKDTree
-                        tree = cKDTree(src_c * np.array(self.voxel_scale))
-                        d_nn, _ = tree.query(src_c[i] * np.array(self.voxel_scale), k=2)
-                        d_avg = d_nn[1] # Distance to nearest neighbor
-                        lam = np.clip(0.40 + (d_avg / 10.0) * 0.45, 0.40, 0.85)
-                        from scipy.spatial import cKDTree
-                        tree = cKDTree(src_c * np.array(self.voxel_scale))
-                        d_nn, _ = tree.query(src_c[i] * np.array(self.voxel_scale), k=2)
-                        d_avg = d_nn[1] # Distance to nearest neighbor
-                        lam = np.clip(0.40 + (d_avg / 10.0) * 0.45, 0.40, 0.85)
-                        # For simplicity, we use a constant base here, but logic is ready
-                        pass
+                            from scipy.spatial import cKDTree
+                            tree = cKDTree(src_c * np.array(self.voxel_scale))
+                            d_nn, _ = tree.query(src_c[i] * np.array(self.voxel_scale), k=2)
+                            d_avg = d_nn[1]
+                            lam = np.clip(0.40 + (d_avg / 10.0) * 0.45, 0.40, 0.85)
+                        # line cleared
+                        # line cleared
+                        # line cleared
+                        # line cleared
+                        # line cleared
+                        # line cleared
                         
                     predicted_coords[i] += (v_prev / np.array(self.voxel_scale)) * lam
             
