@@ -26,7 +26,7 @@ OUTPUT_PRUNE_ISOLATED = True
 
 # HOCT Hierarchical Thresholds for 0.97+ Score
 LEVEL1_CONTINUITY_UM = 7.0      # Local tracklet gate
-LEVEL2_GAP_CLOSE_UM = 10.0      # Tracklet association gate (upgraded from 5.0)
+LEVEL2_GAP_CLOSE_UM = 12.0      # Tracklet association gate (upgraded from 5.0)
 LEVEL3_MITOSIS_GATE_UM = 15.0   # Asymmetric division gate
 
 OUTPUT_GAP_CLOSE = True
@@ -45,7 +45,7 @@ GAP_CLOSE_MAX_ADDED_ABS = 1900
 
 # Bayesian Logit Consensus (BLC) for 0.97+ score
 OUTPUT_BLC_CONSENSUS = True
-BLC_VETO_STRENGTH = 0.8
+BLC_VETO_STRENGTH = 0.5
 BLC_NEUTRAL_THRESHOLD = 0.0
 BLC_DISAGREEMENT_PENALTY = 0.2
 
@@ -61,7 +61,7 @@ GAP2_INSERT_SYNTHETIC = False  # Dual-graph pattern: internal protection only
 # Biological Safe-Division Gating
 SAFE_DIV_MAX_UM = 15.0 # Wide daughter gate for 0.97+ score (StableDet-HOCT strategy)
 SAFE_DIV_SISTER_MAX_UM = 20.0
-SAFE_DIV_SISTER_SYMMETRY_TAU = 0.60
+SAFE_DIV_SISTER_SYMMETRY_TAU = 0.95
 SAFE_DIV_DIVERGE_UM = 2.25
 
 # Continuation Gating

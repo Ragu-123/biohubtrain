@@ -1,4 +1,4 @@
-"""
+﻿"""
 Production Duplicate-Parent Linear Assignment Tracking Solver
 =============================================================
 CZ Biohub 3D Cell Tracking & Division System (Milestone 3 / Requirement R3).
@@ -31,7 +31,7 @@ import scipy.sparse as sp
 # Standard physical constants per competition specifications
 VOXEL_SCALE_UM: Tuple[float, float, float] = (1.625, 0.40625, 0.40625)
 DEFAULT_C_APP: float = 0.10
-DEFAULT_C_DIV: float = 0.62
+DEFAULT_C_DIV: float = 0.45
 DEFAULT_R_MAX_UM: float = 25.0
 DEFAULT_MIN_SISTER_DIST_UM: float = 3.0
 DEFAULT_MAX_SISTER_DIST_UM: float = 18.0
@@ -688,7 +688,7 @@ class DuplicateParentTrackingSolver:
 
         # Acceleration Residue (Kinematic Momentum) for 0.97+ score
         active_velocities = {}
-        lambda_momentum = 0.60
+        lambda_momentum = 0.85
         sigma_accel = 4.5
 
         for step in range(T - 1):
