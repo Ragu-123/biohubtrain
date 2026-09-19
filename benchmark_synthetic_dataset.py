@@ -1,4 +1,4 @@
-"""
+﻿"""
 Comprehensive Multi-Sequence Benchmark on Jose Neto's Synthetic 3D Cell Tracking Dataset
 =======================================================================================
 Evaluates DuplicateParentTrackingSolver + Postprocess Filtering across synthetic 3D sequences.
@@ -230,7 +230,7 @@ def main():
         tot_gt_edges += res['gt_edges']
         tot_gt_divs += res['gt_divisions']
 
-        if (idx + 1) % 10 == 0 or idx == 0 or (idx + 1) == num_to_eval:
+        if (idx + 1) % 1 == 0 or idx == 0 or (idx + 1) == num_to_eval:
             cur_edge_j = tot_edge_tp / (tot_edge_tp + tot_edge_fp + tot_edge_fn) if (tot_edge_tp + tot_edge_fp + tot_edge_fn) > 0 else 0
             cur_div_j = tot_div_tp / (tot_div_tp + tot_div_fp + tot_div_fn) if (tot_div_tp + tot_div_fp + tot_div_fn) > 0 else 0
             cur_score = cur_edge_j + 0.10 * cur_div_j
