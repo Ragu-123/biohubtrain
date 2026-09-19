@@ -187,22 +187,24 @@ def main():
 
     # Setup solver with calibrated parameters
     solver = DuplicateParentTrackingSolver(
-        use_mejc=True, # CRITICAL: Enable ILP solver for 0.97+
+        use_mejc=True,
         c_app=0.10,
-        c_div=0.20, # Ultra-low for synthetic recall
+        c_div=0.65, # Restore high-precision c_div
         min_sister_dist_um=3.0,
-        max_sister_dist_um=30.0, 
-        max_parent_dist_um=25.0, 
-        r_max_um=30.0,
-        mejc_min_prob=0.001,
+        max_sister_dist_um=20.0, 
+        max_parent_dist_um=15.0, 
+        r_max_um=25.0,
+        mejc_min_prob=0.01,
     )
 
     # Post-processing calibration
-    postprocess_clean.SAFE_DIV_SISTER_SYMMETRY_TAU = 0.99
-    postprocess_clean.SAFE_DIV_SISTER_MAX_UM = 30.0
-    postprocess_clean.SAFE_DIV_MAX_UM = 25.0
-    postprocess_clean.SAFE_DIV_GLOBAL_FRAC_CAP = 0.40
-    postprocess_clean.OUTPUT_BLC_CONSENSUS = False # Disable BLC for pure synthetic ground-truth recall
+    postprocess_clean.SAFE_DIV_SISTER_SYMMETRY_TAU = 0.60 # Tighten symmetry for precision
+    postprocess_clean.SAFE_DIV_SISTER_MAX_UM = 18.0
+    postprocess_clean.SAFE_DIV_MAX_UM = 12.0
+    postprocess_clean.SAFE_DIV_GLOBAL_FRAC_CAP = 0.05
+    postprocess_clean.OUTPUT_BLC_CONSENSUS = True
+    postprocess_clean.BLC_VETO_STRENGTH = 0.8
+    postprocess_clean.BLC_DISAGREEMENT_PENALTY = 0.2
 
     t0 = time.time()
     results = []
