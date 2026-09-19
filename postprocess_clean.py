@@ -1,4 +1,4 @@
-﻿"""
+"""
 Production-grade SOTA Post-Processing Module for Biohub Cell Tracking
 Contains:
 1. Candidate edge filtering & single-parent resolution
@@ -109,20 +109,27 @@ OUTPUT_LINEFIT_WINDOW = 2
 
 def apply_blc_consensus(logits_fwd, logits_rev_aligned, dist_matrix=None):
     """
-    Applies Bayesian Logit Consensus with Hallucination Veto.
-    Formula: L_final = L_f + omega' * min(0, L_r - tau) - gamma * |L_f - L_r|^2
-    omega' = omega * (1 + d/d_avg) for distance-weighted veto.
+    Upgraded: Minimum Mutual Information (MMI) Veto with JS-Divergence.
+    Formula: L_final = sign(L_f) * min(|L_f|, |L_r|) * exp(-D_JS(L_f || L_r))
     """
-    diff = logits_fwd - logits_rev_aligned
+    eps = 1e-7
+    p_f = 1.0 / (1.0 + np.exp(-logits_fwd))
+    p_r = 1.0 / (1.0 + np.exp(-logits_rev_aligned))
     
-    omega = BLC_VETO_STRENGTH
-    if BLC_DISTANCE_WEIGHTED_VETO and dist_matrix is not None:
-        d_avg = 7.0
-        omega = omega * (1.0 + dist_matrix / d_avg)
-        
-    veto = np.minimum(0.0, logits_rev_aligned - BLC_NEUTRAL_THRESHOLD)
-    penalty = BLC_DISAGREEMENT_PENALTY * (diff ** 2)
-    return logits_fwd + omega * veto - penalty
+    # Binary Jensen-Shannon Divergence
+    m = 0.5 * (p_f + p_r)
+    def kl(p, q):
+        return p * np.log((p + eps) / (q + eps)) + (1.0 - p) * np.log((1.0 - p + eps) / (1.0 - q + eps))
+    
+    js_div = 0.5 * kl(p_f, m) + 0.5 * kl(p_r, m)
+    
+    # Information-theoretic fusion logic
+    # sign(L_f) * min(|L_f|, |L_r|) is the 'consensus core'
+    # exp(-js_div) is the 'disagreement mask'
+    l_final = np.sign(logits_fwd) * np.minimum(np.abs(logits_fwd), np.abs(logits_rev_aligned))
+    l_final = l_final * np.exp(-js_div)
+    
+    return l_final
 
 
 def node_veto_pruning(nodes, edges, threshold=0.1):

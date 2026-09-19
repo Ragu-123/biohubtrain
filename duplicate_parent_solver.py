@@ -1,4 +1,4 @@
-﻿"""
+"""
 Production Duplicate-Parent Linear Assignment Tracking Solver
 =============================================================
 CZ Biohub 3D Cell Tracking & Division System (Milestone 3 / Requirement R3).
@@ -47,11 +47,20 @@ def compute_physical_distance(
     pos2: Sequence[float],
     voxel_scale: Tuple[float, float, float] = VOXEL_SCALE_UM,
 ) -> float:
-    """Computes physical anisotropic metric distance d_S in microns."""
+    """
+    Computes Riemannian anisotropic distance d_G in microns.
+    Incorporates PSF correction: G = diag(1, 1, 0.25)
+    """
+    # Riemannian PSF scaling factor (z is stretched/dilated in zebrafish PSF)
+    # sigma_z approx 4 * sigma_xy, so we normalize the axial contribution
+    G_z = 0.25 
+    
     dz = (float(pos1[0]) - float(pos2[0])) * voxel_scale[0]
     dy = (float(pos1[1]) - float(pos2[1])) * voxel_scale[1]
     dx = (float(pos1[2]) - float(pos2[2])) * voxel_scale[2]
-    return math.sqrt(dz * dz + dy * dy + dx * dx)
+    
+    # Quadratic form: d^2 = dx^2 + dy^2 + G_z * dz^2
+    return math.sqrt(G_z * (dz ** 2) + dy * dy + dx * dx)
 
 
 def compute_pairwise_physical_distances(
@@ -60,18 +69,20 @@ def compute_pairwise_physical_distances(
     voxel_scale: Tuple[float, float, float] = VOXEL_SCALE_UM,
 ) -> np.ndarray:
     """
-    Vectorized computation of pairwise physical anisotropic metric distances in microns.
-    src_coords: (N, 3) in voxels
-    tgt_coords: (M, 3) in voxels
-    Returns: (N, M) matrix in microns.
+    Vectorized computation of Riemannian pairwise physical distances.
+    G = diag(1, 1, 0.25) for zebrafish PSF correction.
     """
     if src_coords.size == 0 or tgt_coords.size == 0:
         return np.zeros((src_coords.shape[0], tgt_coords.shape[0]), dtype=np.float64)
 
     scale = np.asarray(voxel_scale, dtype=np.float64)
-    # diff: (N, M, 3)
+    # G factor for Z (axial anisotropy)
+    G = np.array([0.25, 1.0, 1.0], dtype=np.float64)
+    
     diff = (src_coords[:, None, :] - tgt_coords[None, :, :]) * scale
-    return np.sqrt(np.sum(diff ** 2, axis=-1))
+    # d^2 = sum(G_k * delta_k^2)
+    dist_sq = np.sum(G[None, None, :] * (diff ** 2), axis=-1)
+    return np.sqrt(dist_sq)
 
 
 class SolvedEdge(NamedTuple):
