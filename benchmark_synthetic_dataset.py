@@ -188,21 +188,21 @@ def main():
     # Setup solver with calibrated parameters
     solver = DuplicateParentTrackingSolver(
         c_app=0.10,
-        c_div=0.45, # Upgraded for 0.97+
+        c_div=0.25, # Further stimulated for high-mitosis synthetic recall
         min_sister_dist_um=3.0,
-        max_sister_dist_um=20.0, # Asymmetric Gating
-        max_parent_dist_um=15.0, # Asymmetric Gating
+        max_sister_dist_um=25.0, # Wider sister gate
+        max_parent_dist_um=20.0, # Wider parent gate
         r_max_um=25.0,
     )
 
     # Post-processing calibration
-    postprocess_clean.SAFE_DIV_SISTER_SYMMETRY_TAU = 0.95
-    postprocess_clean.SAFE_DIV_SISTER_MAX_UM = 20.0
-    postprocess_clean.SAFE_DIV_MAX_UM = 15.0
-    postprocess_clean.SAFE_DIV_GLOBAL_FRAC_CAP = 0.15
+    postprocess_clean.SAFE_DIV_SISTER_SYMMETRY_TAU = 0.99 # Relax symmetry
+    postprocess_clean.SAFE_DIV_SISTER_MAX_UM = 25.0
+    postprocess_clean.SAFE_DIV_MAX_UM = 20.0
+    postprocess_clean.SAFE_DIV_GLOBAL_FRAC_CAP = 0.25
     postprocess_clean.OUTPUT_BLC_CONSENSUS = True
-    postprocess_clean.BLC_VETO_STRENGTH = 0.5
-    postprocess_clean.BLC_DISAGREEMENT_PENALTY = 0.2
+    postprocess_clean.BLC_VETO_STRENGTH = 0.3 # Less aggressive veto for synthetic recall
+    postprocess_clean.BLC_DISAGREEMENT_PENALTY = 0.1
 
     t0 = time.time()
     results = []
