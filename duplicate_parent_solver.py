@@ -739,6 +739,11 @@ class DuplicateParentTrackingSolver:
                         d_nn, _ = tree.query(src_c[i] * np.array(self.voxel_scale), k=2)
                         d_avg = d_nn[1] # Distance to nearest neighbor
                         lam = np.clip(0.40 + (d_avg / 10.0) * 0.45, 0.40, 0.85)
+                        from scipy.spatial import cKDTree
+                        tree = cKDTree(src_c * np.array(self.voxel_scale))
+                        d_nn, _ = tree.query(src_c[i] * np.array(self.voxel_scale), k=2)
+                        d_avg = d_nn[1] # Distance to nearest neighbor
+                        lam = np.clip(0.40 + (d_avg / 10.0) * 0.45, 0.40, 0.85)
                         # For simplicity, we use a constant base here, but logic is ready
                         pass
                         
