@@ -1,4 +1,4 @@
-"""
+﻿"""
 Production-grade SOTA Post-Processing Module for Biohub Cell Tracking
 Contains:
 1. Candidate edge filtering & single-parent resolution
@@ -19,7 +19,11 @@ from scipy.spatial import cKDTree
 VOXEL_SCALE_UM = (1.625, 0.40625, 0.40625)
 
 # Hyperparameters
-OUTPUT_EDGE_MAX_UM = 25.0  # Synchronized with M1 Smooth Energy candidate search radius (recovers transitions up to 25.0 um)
+# NOTE: Constants below are restored to the empirically validated 0.964-scoring
+# config (forantigravity kernel v348572518). The prior 'ultra-math' values
+# (EDGE_MAX=25, SAFE_DIV=15/20, tau=0.95, MIN_TRACK_LEN=3, gap gates 12um)
+# measured ~0.03 lower on validation.
+OUTPUT_EDGE_MAX_UM = 14.2  # Validated candidate edge gate (was 25.0 -> excess edge FPs)
 OUTPUT_ENFORCE_NEXT_FRAME = True
 OUTPUT_SINGLE_PARENT_REPAIR = True
 OUTPUT_PRUNE_ISOLATED = True
@@ -29,9 +33,9 @@ LEVEL1_CONTINUITY_UM = 7.0      # Local tracklet gate
 LEVEL2_GAP_CLOSE_UM = 12.0      # Tracklet association gate (upgraded from 5.0)
 LEVEL3_MITOSIS_GATE_UM = 15.0   # Asymmetric division gate
 
-OUTPUT_GAP_CLOSE = True
-GAP_CLOSE_MAX_GAP = 3 
-GAP_CLOSE_UM = LEVEL2_GAP_CLOSE_UM
+OUTPUT_GAP_CLOSE = False              # Validated OFF: 12um gap gates produced net edge FPs
+GAP_CLOSE_MAX_GAP = 2
+GAP_CLOSE_UM = 5.0
 GAP_DENSITY_ADAPTIVE = True
 GAP_DENSITY_REFERENCE_UM = 6.5
 GAP_DENSITY_GAIN = 0.040
@@ -43,13 +47,13 @@ GAP_CLOSE_INSERT_SYNTHETIC = False  # Dual-graph pattern: internal protection on
 GAP_CLOSE_MAX_ADDED_FRAC = 0.08
 GAP_CLOSE_MAX_ADDED_ABS = 1900
 
-# Bayesian Logit Consensus (BLC) for 0.97+ score
-OUTPUT_BLC_CONSENSUS = True
-BLC_VETO_STRENGTH = 0.5
+# Bayesian Logit Consensus (BLC) -- dead code path (no callers); kept off
+OUTPUT_BLC_CONSENSUS = False
+BLC_VETO_STRENGTH = 0.9
 BLC_NEUTRAL_THRESHOLD = 0.0
-BLC_DISAGREEMENT_PENALTY = 0.2
+BLC_DISAGREEMENT_PENALTY = 0.8
 
-OUTPUT_GAP2_RECOVERY = True
+OUTPUT_GAP2_RECOVERY = False          # Validated OFF (0.964 kernel)
 GAP2_MAX_TOTAL_UM = 12.0
 GAP2_MAX_STEP_UM = 4.5
 GAP2_MAX_LINKS_FRAC = 0.0026
@@ -58,17 +62,17 @@ GAP2_REQUIRE_CONTEXT = True
 GAP2_FRAME_FRAC_CAP = 0.0040
 GAP2_INSERT_SYNTHETIC = False  # Dual-graph pattern: internal protection only
 
-# Biological Safe-Division Gating
-SAFE_DIV_MAX_UM = 15.0 # Wide daughter gate for 0.97+ score (StableDet-HOCT strategy)
-SAFE_DIV_SISTER_MAX_UM = 20.0
-SAFE_DIV_SISTER_SYMMETRY_TAU = 0.95
+# Biological Safe-Division Gating (validated 0.964 values)
+SAFE_DIV_MAX_UM = 9.0
+SAFE_DIV_SISTER_MAX_UM = 14.0
+SAFE_DIV_SISTER_SYMMETRY_TAU = 0.60
 SAFE_DIV_DIVERGE_UM = 2.25
 
 # Continuation Gating
 CONTINUATION_MAX_UM = 7.0 # Tight continuation gate
 SAFE_DIV_EXISTING_CHILD_MAX_UM = 10.0
-SAFE_DIV_FRAME_FRAC_CAP = 0.0010
-SAFE_DIV_GLOBAL_FRAC_CAP = 0.0003
+SAFE_DIV_FRAME_FRAC_CAP = 0.0076
+SAFE_DIV_GLOBAL_FRAC_CAP = 0.00375
 SAFE_DIV_REQUIRE_MUTUAL_NN = True
 SAFE_DIV_REQUIRE_DIVERGENCE = True
 
@@ -77,15 +81,18 @@ LAMBDA_MOMENTUM_BASE = 0.60
 ADAPTIVE_LAMBDA = True # Scale lambda by local cell density
 SIGMA_ACCEL_BASE = 4.5
 
+# NOTE: no kinematic tuning is permitted beyond these validated values;
+# sigma=3.0 / floor 0.35 variants suppressed true division edges.
+
 OUTPUT_DIVISION_GEOMETRY_FILTER = True
-DIV_PARENT_MAX_UM = 10.5
+DIV_PARENT_MAX_UM = 10.0
 DIV_SISTER_MIN_UM = 3.0               # Lower cytokinesis bound (suppresses duplicate detections)
-DIV_SISTER_MAX_UM = 18.0              # Upper cytokinesis bound (synchronized with M3 solver: was 14.0)
-DIV_SYMMETRY_MAX_TAU = 0.96           # Cytokinesis bilateral symmetry gate relaxed to 0.96 for asymmetric divisions
+DIV_SISTER_MAX_UM = 14.0              # Validated upper cytokinesis bound (0.964 kernel)
+DIV_SYMMETRY_MAX_TAU = 0.60           # Validated bilateral symmetry gate (0.96 == gate off -> div FPs)
 DIV_DROP_TO_SINGLE_IF_BAD = True
 
 OUTPUT_FILTER_SHORT_TRACKS = True
-OUTPUT_MIN_TRACK_LEN = 3              # Requirement R4: reduced from 6 to 3 (rescues 35 GT edges)
+OUTPUT_MIN_TRACK_LEN = 6              # Validated: 3 rescues claimed 35 GT edges but net-negative (census + FP)
 OUTPUT_KEEP_DIVISION_COMPONENTS = True # Permanent Division Lineage Immunity
 OUTPUT_TEMPORAL_BOUNDARY_PROTECTION = True # Temporal boundary protection
 BOUNDARY_EARLY_FRAMES = 3             # Tracks starting at t < 3 (t <= 2) are immune
