@@ -46,6 +46,130 @@ except ImportError:
 
 
 # ==============================================================================
+# DIVISION GATING TRITON KERNELS
+# ==============================================================================
+
+if HAS_TRITON:
+    @triton.jit
+    def _division_symmetry_kernel(
+        coords_ptr,        # [N, 3] (z, y, x) in microns
+        candidate_ptr,     # [E, 3] (parent_idx, d1_idx, d2_idx)
+        out_scores_ptr,    # [E]
+        n_edges: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """
+        Calculates normalized dot-product symmetry gate: (v1 . v2) / (|v1|*|v2|)
+        v1 = d1 - p, v2 = d2 - p
+        """
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_edges
+
+        # Load indices
+        p_idx = tl.load(candidate_ptr + offsets * 3 + 0, mask=mask)
+        d1_idx = tl.load(candidate_ptr + offsets * 3 + 1, mask=mask)
+        d2_idx = tl.load(candidate_ptr + offsets * 3 + 2, mask=mask)
+
+        # Load coordinates (microns)
+        p_z = tl.load(coords_ptr + p_idx * 3 + 0, mask=mask)
+        p_y = tl.load(coords_ptr + p_idx * 3 + 1, mask=mask)
+        p_x = tl.load(coords_ptr + p_idx * 3 + 2, mask=mask)
+
+        d1_z = tl.load(coords_ptr + d1_idx * 3 + 0, mask=mask)
+        d1_y = tl.load(coords_ptr + d1_idx * 3 + 1, mask=mask)
+        d1_x = tl.load(coords_ptr + d1_idx * 3 + 2, mask=mask)
+
+        d2_z = tl.load(coords_ptr + d2_idx * 3 + 0, mask=mask)
+        d2_y = tl.load(coords_ptr + d2_idx * 3 + 1, mask=mask)
+        d2_x = tl.load(coords_ptr + d2_idx * 3 + 2, mask=mask)
+
+        # Vectors
+        v1_z, v1_y, v1_x = d1_z - p_z, d1_y - p_y, d1_x - p_x
+        v2_z, v2_y, v2_x = d2_z - p_z, d2_y - p_y, d2_x - p_x
+
+        # Dot product
+        dot = v1_z * v2_z + v1_y * v2_y + v1_x * v2_x
+        
+        # Norms
+        norm1 = tl.sqrt(v1_z * v1_z + v1_y * v1_y + v1_x * v1_x + 1e-8)
+        norm2 = tl.sqrt(v2_z * v2_z + v2_y * v2_y + v2_x * v2_x + 1e-8)
+
+        # Cosine similarity
+        cos_sim = dot / (norm1 * norm2)
+        
+        tl.store(out_scores_ptr + offsets, cos_sim, mask=mask)
+
+    @triton.jit
+    def _intensity_conservation_kernel(
+        intensities_ptr,   # [N] float
+        candidate_ptr,     # [E, 3] (parent_idx, d1_idx, d2_idx)
+        out_ratios_ptr,    # [E]
+        n_edges: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """
+        Calculates (I_d1 + I_d2) / I_p
+        """
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_edges
+
+        p_idx = tl.load(candidate_ptr + offsets * 3 + 0, mask=mask)
+        d1_idx = tl.load(candidate_ptr + offsets * 3 + 1, mask=mask)
+        d2_idx = tl.load(candidate_ptr + offsets * 3 + 2, mask=mask)
+
+        ip = tl.load(intensities_ptr + p_idx, mask=mask)
+        i1 = tl.load(intensities_ptr + d1_idx, mask=mask)
+        i2 = tl.load(intensities_ptr + d2_idx, mask=mask)
+
+        ratio = (i1 + i2) / (ip + 1e-8)
+        tl.store(out_ratios_ptr + offsets, ratio, mask=mask)
+
+
+def compute_division_priors_triton(
+    coords: torch.Tensor,
+    intensities: torch.Tensor,
+    candidates: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    candidates: (E, 3) int64 tensor of (parent, d1, d2)
+    Returns: (cos_sims, int_ratios)
+    """
+    if not HAS_TRITON or not coords.is_cuda:
+        # Vectorized PyTorch fallback
+        p = coords[candidates[:, 0]]
+        d1 = coords[candidates[:, 1]]
+        d2 = coords[candidates[:, 2]]
+        v1, v2 = d1 - p, d2 - p
+        cos_sims = F.cosine_similarity(v1, v2, dim=-1)
+        
+        ip = intensities[candidates[:, 0]]
+        i1 = intensities[candidates[:, 1]]
+        i2 = intensities[candidates[:, 2]]
+        int_ratios = (i1 + i2) / (ip + 1e-8)
+        return cos_sims, int_ratios
+
+    E = candidates.shape[0]
+    cos_sims = torch.empty(E, device=coords.device, dtype=torch.float32)
+    int_ratios = torch.empty(E, device=coords.device, dtype=torch.float32)
+    
+    grid = lambda META: (triton.cdiv(E, META['BLOCK_SIZE']),)
+    
+    _division_symmetry_kernel[grid](
+        coords, candidates, cos_sims,
+        E, BLOCK_SIZE=1024
+    )
+    
+    _intensity_conservation_kernel[grid](
+        intensities, candidates, int_ratios,
+        E, BLOCK_SIZE=1024
+    )
+    
+    return cos_sims, int_ratios
+
+
+# ==============================================================================
 # TRITON JIT KERNELS (Active when Triton & CUDA are available)
 # ==============================================================================
 
@@ -766,6 +890,202 @@ def filter_candidates_triton(
         return cand_mask, dist_matrix
 
 
+# ==============================================================================
+# DIVISION-GEOMETRY PRIOR KERNEL (D3C: Division-Jaccard Decision Calculus)
+# ==============================================================================
+# Scores every candidate cytokinesis fork (parent, d1, d2) with the smooth
+# product-form geometry prior from src/evaluation/division_jaccard.py:
+#   tau      = |r1 - r2| / (r1 + r2)              (bilateral symmetry)
+#   mid_off  = | 0.5*(w1 + w2) - v |              (equatorial midpoint conservation,
+#                                                 w = daughter - comoving parent)
+#   cos      = <w1, w2> / (|w1| |w2|)             (spindle orthogonality)
+#   p_geom   = Phi_tau * Phi_mid * sigmoid(-(cos - gate)/0.25) * sister_window
+# One Triton program per fork; all quantities in registers, zero divergence.
+
+if HAS_TRITON:
+    @triton.jit
+    def _division_geometry_kernel(
+        coords_ptr,        # [N, 3] float32 voxel coords (z, y, x)
+        velocity_ptr,      # [N, 3] float32 parent velocities (um/frame), zeros if static
+        forks_ptr,         # [E, 3] int32 (parent_idx, d1_idx, d2_idx)
+        out_ptr,           # [E] float32 geometry scores in [0, 1]
+        sz, sy, sx,        # voxel scale (um)
+        tau_scale, mid_scale, cos_gate, sister_lo, sister_hi,
+        stride_cn, stride_cc,
+        stride_fe, stride_fc,
+    ):
+        e = tl.program_id(0)
+
+        p_idx = tl.load(forks_ptr + e * stride_fe + 0 * stride_fc)
+        d1_idx = tl.load(forks_ptr + e * stride_fe + 1 * stride_fc)
+        d2_idx = tl.load(forks_ptr + e * stride_fe + 2 * stride_fc)
+
+        pz = tl.load(coords_ptr + p_idx * stride_cn + 0 * stride_cc)
+        py = tl.load(coords_ptr + p_idx * stride_cn + 1 * stride_cc)
+        px = tl.load(coords_ptr + p_idx * stride_cn + 2 * stride_cc)
+        a1z = tl.load(coords_ptr + d1_idx * stride_cn + 0 * stride_cc)
+        a1y = tl.load(coords_ptr + d1_idx * stride_cn + 1 * stride_cc)
+        a1x = tl.load(coords_ptr + d1_idx * stride_cn + 2 * stride_cc)
+        a2z = tl.load(coords_ptr + d2_idx * stride_cn + 0 * stride_cc)
+        a2y = tl.load(coords_ptr + d2_idx * stride_cn + 1 * stride_cc)
+        a2x = tl.load(coords_ptr + d2_idx * stride_cn + 2 * stride_cc)
+
+        vz = tl.load(velocity_ptr + p_idx * stride_cn + 0 * stride_cc)
+        vy = tl.load(velocity_ptr + p_idx * stride_cn + 1 * stride_cc)
+        vx = tl.load(velocity_ptr + p_idx * stride_cn + 2 * stride_cc)
+
+        # Physical daughter vectors from the co-moving parent position
+        w1z = (a1z - pz) * sz - vz
+        w1y = (a1y - py) * sy - vy
+        w1x = (a1x - px) * sx - vx
+        w2z = (a2z - pz) * sz - vz
+        w2y = (a2y - py) * sy - vy
+        w2x = (a2x - px) * sx - vx
+
+        r1 = tl.sqrt(w1z * w1z + w1y * w1y + w1x * w1x + 1e-12)
+        r2 = tl.sqrt(w2z * w2z + w2y * w2y + w2x * w2x + 1e-12)
+
+        # g1: bilateral symmetry tau
+        tau = tl.abs(r1 - r2) / (r1 + r2 + 1e-9)
+
+        # g2: equatorial midpoint conservation (comoving frame)
+        mzx = 0.5 * (w1z + w2z)
+        myy = 0.5 * (w1y + w2y)
+        mxx = 0.5 * (w1x + w2x)
+        mid_off = tl.sqrt(mzx * mzx + myy * myy + mxx * mxx + 1e-12)
+
+        # g3: spindle orthogonality
+        dot = w1z * w2z + w1y * w2y + w1x * w2x
+        cos_sp = dot / (r1 * r2 + 1e-9)
+
+        # Sister separation in um (isotropic physical norm)
+        dsz = (a1z - a2z) * sz
+        dsy = (a1y - a2y) * sy
+        dsx = (a1x - a2x) * sx
+        sis = tl.sqrt(dsz * dsz + dsy * dsy + dsx * dsx + 1e-12)
+
+        phi_tau = tl.exp(-0.5 * (tau / tau_scale) * (tau / tau_scale))
+        phi_mid = tl.exp(-0.5 * (mid_off / mid_scale) * (mid_off / mid_scale))
+        phi_cos = 1.0 / (1.0 + tl.exp((cos_sp - cos_gate) / 0.25))
+
+        # Smooth sister-distance window over [sister_lo, sister_hi]
+        center = 0.5 * (sister_lo + sister_hi)
+        width = 0.5 * (sister_hi - sister_lo)
+        u = (sis - center) / width
+        phi_sis = tl.exp(-0.5 * u * u * u * u)
+        window = 0.5 + 0.5 * phi_sis
+        in_band = (sis >= sister_lo) & (sis <= sister_hi)
+
+        score = phi_tau * phi_mid * phi_cos * tl.where(in_band, window, 0.0)
+        tl.store(out_ptr + e, score)
+
+
+def _division_geometry_scores_fallback(
+    coords: torch.Tensor,
+    velocity: torch.Tensor,
+    forks: torch.Tensor,
+    scale: Tuple[float, float, float],
+    tau_scale: float,
+    mid_scale: float,
+    cos_gate: float,
+    sister_lo: float,
+    sister_hi: float,
+) -> torch.Tensor:
+    """Vectorized PyTorch twin of _division_geometry_kernel (CPU / no-Triton)."""
+    c = coords.double()
+    v = velocity.double()
+    s = torch.tensor(scale, dtype=torch.float64, device=c.device)
+
+    P = c[forks[:, 0].long()]
+    D1 = c[forks[:, 1].long()]
+    D2 = c[forks[:, 2].long()]
+    vp = v[forks[:, 0].long()]
+
+    w1 = (D1 - P) * s - vp
+    w2 = (D2 - P) * s - vp
+    r1 = w1.norm(dim=-1).clamp_min(1e-12)
+    r2 = w2.norm(dim=-1).clamp_min(1e-12)
+
+    tau = (r1 - r2).abs() / (r1 + r2 + 1e-9)
+    mid_off = (0.5 * (w1 + w2)).norm(dim=-1).clamp_min(1e-12)
+    cos_sp = (w1 * w2).sum(-1) / (r1 * r2 + 1e-9)
+
+    sis = ((D1 - D2) * s).norm(dim=-1).clamp_min(1e-12)
+
+    phi_tau = torch.exp(-0.5 * (tau / tau_scale) ** 2)
+    phi_mid = torch.exp(-0.5 * (mid_off / mid_scale) ** 2)
+    phi_cos = torch.sigmoid(-(cos_sp - cos_gate) / 0.25)
+
+    center = 0.5 * (sister_lo + sister_hi)
+    width = 0.5 * (sister_hi - sister_lo)
+    u = (sis - center) / width
+    phi_sis = torch.exp(-0.5 * u ** 4)
+    window = 0.5 + 0.5 * phi_sis
+    in_band = (sis >= sister_lo) & (sis <= sister_hi)
+
+    return (phi_tau * phi_mid * phi_cos * torch.where(in_band, window, torch.zeros_like(window))).float()
+
+
+def division_geometry_scores_triton(
+    coords: torch.Tensor,
+    forks: torch.Tensor,
+    scale: Tuple[float, float, float] = (1.625, 0.40625, 0.40625),
+    velocity: Optional[torch.Tensor] = None,
+    tau_scale: float = 0.40,
+    mid_scale_um: float = 2.4,
+    cos_gate: float = -0.60,
+    sister_lo_um: float = 3.0,
+    sister_hi_um: float = 16.0,
+) -> torch.Tensor:
+    """
+    GPU-parallel cytokinesis geometry scoring for all candidate forks.
+
+    Args:
+        coords:   (N, 3) float tensor of voxel coords (z, y, x)
+        forks:    (E, 3) int64 tensor of (parent_idx, d1_idx, d2_idx)
+        scale:    voxel physical scale in um (sz, sy, sx)
+        velocity: optional (N, 3) parent velocities in um/frame (co-moving frame);
+                  zeros used when None
+    Returns:
+        (E,) float32 geometry scores in [0, 1]
+    """
+    E = forks.shape[0]
+    if E == 0:
+        return torch.empty(0, device=coords.device, dtype=torch.float32)
+
+    if velocity is None:
+        velocity = torch.zeros_like(coords)
+
+    if not HAS_TRITON or not coords.is_cuda:
+        return _division_geometry_scores_fallback(
+            coords, velocity, forks, scale, tau_scale, mid_scale_um,
+            cos_gate, sister_lo_um, sister_hi_um
+        )
+
+    try:
+        device = coords.device
+        c = coords.contiguous().float()
+        v = velocity.contiguous().float()
+        f = forks.to(device).contiguous().int()
+        out = torch.empty(E, device=device, dtype=torch.float32)
+
+        with torch.cuda.device(device):
+            _division_geometry_kernel[(E,)](
+                c, v, f, out,
+                float(scale[0]), float(scale[1]), float(scale[2]),
+                float(tau_scale), float(mid_scale_um), float(cos_gate),
+                float(sister_lo_um), float(sister_hi_um),
+                c.stride(0), c.stride(1),
+                f.stride(0), f.stride(1),
+            )
+        return out
+    except Exception:
+        return _division_geometry_scores_fallback(
+            coords, velocity, forks, scale, tau_scale, mid_scale_um,
+            cos_gate, sister_lo_um, sister_hi_um
+        )
+
+
 # Public alias conforming to blueprint specification
 fused_anisotropic_candidate_filter = filter_candidates_triton
 
@@ -775,11 +1095,14 @@ __all__ = [
     "_trilinear_feature_kernel",
     "_hessian_subvoxel_kernel",
     "fused_anisotropic_candidate_filter_kernel",
+    "_division_geometry_kernel",
     "trilinear_index_triton",
     "refine_subvoxel_peaks_triton",
     "filter_candidates_triton",
     "fused_anisotropic_candidate_filter",
+    "division_geometry_scores_triton",
     "_trilinear_index_fallback",
     "_refine_subvoxel_peaks_fallback",
     "_filter_candidates_fallback",
+    "_division_geometry_scores_fallback",
 ]
