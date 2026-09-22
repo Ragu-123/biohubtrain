@@ -1203,6 +1203,25 @@ def process_single_volume(ds_path: Path, device: torch.device, m0, m1, window_si
 
     filt_nodes, filt_edges, stats = filter_output_graph(nodes_by_id, raw_edges, dataset=stem)
 
+    # --- D3C-EXP: dump POST-ILP graph (the actual submission) for division scoring ---
+    try:
+        _fd = os.environ.get('FORKDUMP_DIR', '/kaggle/working/forkdumps')
+        os.makedirs(_fd, exist_ok=True)
+        _sel = np.asarray([[e['source_id'], e['target_id']] for e in raw_edges], dtype=np.int64) \
+            if raw_edges else np.zeros((0, 2), dtype=np.int64)
+        _pos_map = {int(nid): (float(v['t']), float(v['z']), float(v['y']), float(v['x']))
+                    for nid, v in nodes_by_id.items()}
+        _t_arr = np.array([v[0] for v in _pos_map.values()])
+        _p_arr = np.array([v[1:] for v in _pos_map.values()])
+        np.savez_compressed(os.path.join(_fd, f'{stem}_postilp.npz'),
+                            node_ids=np.asarray(list(_pos_map.keys()), dtype=np.int64),
+                            node_t=_t_arr, node_pos=_p_arr,
+                            edges=_sel)
+        print(f'[dump-postilp] {stem}: {len(_pos_map)} nodes, {len(_sel)} selected edges', flush=True)
+    except Exception as _e:
+        print(f'[dump-postilp] FAILED {stem}: {_e}', flush=True)
+    # --- end D3C-EXP ---
+
     dt = time.time() - t0
 
     pruned = len(nodes_by_id) - len(filt_nodes)
