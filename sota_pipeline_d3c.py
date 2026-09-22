@@ -466,7 +466,7 @@ def find_test_dir():
 
 
 
-TEST_DIR = find_test_dir()
+TEST_DIR = (Path(os.environ["SOTA_TEST_DIR"]) if os.environ.get("SOTA_TEST_DIR") else find_test_dir())
 
 OUTPUT_CSV = Path("/kaggle/working/submission.csv")
 
